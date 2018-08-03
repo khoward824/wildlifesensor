@@ -1,1 +1,23 @@
-# This will be our main file
+from gpiozero import MotionSensor
+from picamera import PiCamera
+from datetime import datetime
+
+pir = MotionSensor (4, queue_len = 5)
+
+camera = PiCamera()
+
+filename = "intruder.h264"
+
+while True:
+    pir.wait_for_motion()
+    print("motion detected!")
+    now = datetime.now()
+    filename = "{0:%Y}-{0:%m}-{0:%d}" .format(now)
+    camera.start_recording(filename)
+    timecount = 100
+    while  timecount < 100:
+            timecount +=  1
+    pir.wait_for_no_motion()
+    camera.stop_recording()
+    print("motion done")
+    break 
