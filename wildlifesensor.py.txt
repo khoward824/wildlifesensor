@@ -1,23 +1,480 @@
-from gpiozero import MotionSensor
-from picamera import PiCamera
+#!/usr/bin/env python3
+"""
+wildlifesensor.py
+-----------------
+Raspberry Pi wildlife camera trap.
+
+Hardware
+--------
+- PIR motion sensor on GPIO 4
+- Raspberry Pi Camera Module (any revision)
+
+Behaviour
+---------
+1. Wait for motion.
+2. Start recording an H.264 video file with a timestamp-based name.
+3. Keep recording for at least MIN_RECORD_SECONDS.
+4. Keep recording until motion stops (or MAX_RECORD_SECONDS is reached).
+5. Stop recording, log the clip, then go back to step 1.
+
+All errors are caught so the sensor keeps running unattended.
+"""
+
+import logging
+import os
+import signal
+import sys
+import time
 from datetime import datetime
+from pathlib import Path
 
-pir = MotionSensor (4, queue_len = 5)
+# ---------------------------------------------------------------------------
+# Third-party imports – fail early with a helpful message if missing
+# ---------------------------------------------------------------------------
+try:
+    from gpiozero import MotionSensor
+except ImportError as exc:
+    sys.exit(f"[FATAL] gpiozero not available: {exc}  (run: pip install gpiozero)")
 
-camera = PiCamera()
+try:
+    from picamera import PiCamera
+    from picamera import PiCameraError
+except ImportError as exc:
+    sys.exit(f"[FATAL] picamera not available: {exc}  (run: pip install picamera)")
 
-filename = "intruder.h264"
+# ---------------------------------------------------------------------------
+# Configuration – change these without touching the logic below
+# ---------------------------------------------------------------------------
+GPIO_PIN            = 4          # BCM pin number for the PIR DATA line
+PIR_QUEUE_LEN       = 5          # samples the PIR averages before firing
+PIR_CALIBRATION_TIMEOUT = 30     # seconds to wait for PIR to settle at startup
+CAMERA_RESOLUTION   = (1280, 720)
+CAMERA_FRAMERATE    = 30
+CAMERA_WARMUP_SECS  = 2.0        # auto-exposure warm-up time
+CAMERA_ROTATION     = 0          # degrees: 0, 90, 180, or 270
+VIDEO_DIR           = Path("/home/pi/wildlife_videos")   # where clips are saved
+MIN_RECORD_SECONDS  = 10.0       # always record at least this long
+MAX_RECORD_SECONDS  = 300.0      # hard cap so a stuck PIR doesn't fill the disk
+NO_MOTION_TIMEOUT   = 30.0       # give up waiting for motion-end after this many s
+MOTION_POLL_INTERVAL = 0.1       # seconds between motion-state polls inside a clip
+WAIT_MOTION_TIMEOUT  = 5.0       # seconds per wait_for_motion() call in main loop
+LOG_FILE            = VIDEO_DIR / "sensor.log"
+LOG_LEVEL           = logging.INFO
+MIN_FREE_MB         = 200        # refuse to start a clip if less than this is available
+CLIP_INDEX_FILE     = VIDEO_DIR / "clip_index.csv"  # append-only log of every clip
 
-while True:
-    pir.wait_for_motion()
-    print("motion detected!")
-    now = datetime.now()
-    filename = "{0:%Y}-{0:%m}-{0:%d}" .format(now)
-    camera.start_recording(filename)
-    timecount = 100
-    while  timecount < 100:
-            timecount +=  1
-    pir.wait_for_no_motion()
-    camera.stop_recording()
-    print("motion done")
-    break 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def _configure_logging() -> logging.Logger:
+    """Configure console + rotating file logging and return the root logger."""
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+
+    fmt     = "%(asctime)s  %(levelname)-8s  %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    # Use a rotating file handler so the log never grows without bound.
+    try:
+        from logging.handlers import RotatingFileHandler
+        file_handler: logging.Handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=5 * 1024 * 1024,   # 5 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        )
+    except Exception:
+        # Fall back to a plain FileHandler if RotatingFileHandler fails.
+        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+
+    console_handler = logging.StreamHandler(sys.stdout)
+
+    for handler in (file_handler, console_handler):
+        handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+
+    logger = logging.getLogger("wildlifesensor")
+    logger.setLevel(LOG_LEVEL)
+    # Avoid duplicate handlers when the module is reloaded in tests.
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+
+    return logger
+
+
+log = _configure_logging()
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown on SIGINT / SIGTERM
+# ---------------------------------------------------------------------------
+_shutdown_requested = False
+
+
+def _handle_signal(signum: int, _frame) -> None:
+    """Set the global shutdown flag; the main loop will exit at the next safe point."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    try:
+        sig_name = signal.Signals(signum).name
+    except ValueError:
+        sig_name = str(signum)
+    # Use print here as a last resort in case the logging system is broken.
+    log.info(
+        "Shutdown signal %s received – finishing current clip then exiting.",
+        sig_name,
+    )
+
+
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_filename(directory: Path) -> Path:
+    """Return a unique timestamped H.264 path inside *directory*.
+
+    If the obvious name already exists (two events within the same second),
+    a numeric suffix is appended so no clip is ever silently overwritten.
+    """
+    now  = datetime.now()
+    base = now.strftime("%Y-%m-%d_%H-%M-%S")
+    candidate = directory / f"{base}.h264"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{base}_{counter:03d}.h264"
+        counter += 1
+    return candidate
+
+
+def _free_space_mb(path: Path) -> float:
+    """Return free disk space in MB for the filesystem containing *path*."""
+    try:
+        stat = os.statvfs(path)
+        return (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+    except OSError as exc:
+        log.error("Could not check disk space for %s: %s", path, exc)
+        # Return 0 so callers conservatively refuse to record.
+        return 0.0
+
+
+def _enough_disk_space() -> bool:
+    """Return True when there is enough free space to start a new clip."""
+    free = _free_space_mb(VIDEO_DIR)
+    if free < MIN_FREE_MB:
+        log.warning(
+            "Low disk space: %.1f MB free (need %d MB) – skipping clip.",
+            free,
+            MIN_FREE_MB,
+        )
+        return False
+    return True
+
+
+def _append_clip_index(filepath: Path, duration: float, file_mb: float) -> None:
+    """Append a one-line CSV record to the clip index so clips can be catalogued."""
+    try:
+        write_header = not CLIP_INDEX_FILE.exists()
+        with CLIP_INDEX_FILE.open("a", encoding="utf-8") as fh:
+            if write_header:
+                fh.write("timestamp,filename,duration_s,size_mb\n")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            fh.write(
+                f"{timestamp},{filepath.name},{duration:.1f},{file_mb:.3f}\n"
+            )
+    except OSError as exc:
+        log.warning("Could not update clip index: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Camera context manager
+# ---------------------------------------------------------------------------
+
+def _open_camera() -> PiCamera:
+    """Initialise and return a ready-to-use PiCamera instance.
+
+    Raises
+    ------
+    PiCameraError
+        Propagated from picamera if the hardware cannot be opened.
+    """
+    try:
+        camera = PiCamera()
+    except PiCameraError as exc:
+        log.critical("Failed to open camera: %s", exc, exc_info=True)
+        raise
+
+    try:
+        camera.resolution = CAMERA_RESOLUTION
+        camera.framerate  = CAMERA_FRAMERATE
+        camera.rotation   = CAMERA_ROTATION
+
+        # Brief warm-up so the sensor auto-exposure settles before we record.
+        log.debug("Camera warm-up (%.1f s) …", CAMERA_WARMUP_SECS)
+        camera.start_preview()
+        time.sleep(CAMERA_WARMUP_SECS)
+        camera.stop_preview()
+
+        log.info(
+            "Camera initialised at %dx%d @ %d fps (rotation=%d°).",
+            CAMERA_RESOLUTION[0],
+            CAMERA_RESOLUTION[1],
+            CAMERA_FRAMERATE,
+            CAMERA_ROTATION,
+        )
+    except Exception:
+        # If configuration fails, close the camera handle before re-raising
+        # so we don't leak the resource.
+        try:
+            camera.close()
+        except Exception:
+            pass
+        raise
+
+    return camera
+
+
+# ---------------------------------------------------------------------------
+# Core recording logic
+# ---------------------------------------------------------------------------
+
+# Module-level reference to the PIR sensor so that record_clip() can read it.
+# Assigned in main() before record_clip() is ever called.
+pir: MotionSensor
+
+
+def record_clip(camera: PiCamera) -> None:
+    """Record one motion-triggered clip.
+
+    Parameters
+    ----------
+    camera:
+        An already-initialised, open PiCamera instance.
+
+    The function returns normally (never raises) so the main loop always
+    continues to the next iteration.
+    """
+    if not _enough_disk_space():
+        # Pause briefly to avoid hammering disk-space checks at full speed.
+        time.sleep(1.0)
+        return
+
+    filepath   = _make_filename(VIDEO_DIR)
+    start_time = time.monotonic()
+    recording  = False
+
+    log.info("Motion detected – recording → %s", filepath.name)
+
+    try:
+        camera.start_recording(str(filepath))
+        recording = True
+
+        # ── Phase 1: Mandatory minimum recording window ──────────────────
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= MIN_RECORD_SECONDS:
+                break
+            if _shutdown_requested:
+                log.info("Shutdown requested during minimum buffer – stopping early.")
+                break
+            time.sleep(MOTION_POLL_INTERVAL)
+
+        # ── Phase 2: Record until motion stops or hard cap is reached ─────
+        if not _shutdown_requested:
+            motion_end_deadline = time.monotonic() + NO_MOTION_TIMEOUT
+            max_deadline        = start_time + MAX_RECORD_SECONDS
+
+            while not _shutdown_requested:
+                now_mono = time.monotonic()
+
+                # Hard cap check
+                if now_mono >= max_deadline:
+                    log.warning(
+                        "Maximum recording duration (%.0f s) reached – stopping.",
+                        MAX_RECORD_SECONDS,
+                    )
+                    break
+
+                # Read current debounced motion state
+                try:
+                    motion_active = pir.motion_detected
+                except Exception as exc:
+                    log.error("Error reading PIR state: %s – assuming no motion.", exc)
+                    motion_active = False
+
+                if motion_active:
+                    # Motion still ongoing – push the no-motion deadline forward.
+                    motion_end_deadline = time.monotonic() + NO_MOTION_TIMEOUT
+                    log.debug("Motion still active – resetting no-motion deadline.")
+                else:
+                    if now_mono >= motion_end_deadline:
+                        log.debug("No motion for %.0f s – ending clip.", NO_MOTION_TIMEOUT)
+                        break
+
+                time.sleep(MOTION_POLL_INTERVAL)
+
+    except PiCameraError as exc:
+        log.error("PiCamera error during recording: %s", exc, exc_info=True)
+    except Exception as exc:
+        log.error("Unexpected error during recording: %s", exc, exc_info=True)
+    finally:
+        if recording:
+            try:
+                camera.stop_recording()
+                log.debug("camera.stop_recording() called.")
+            except PiCameraError as exc:
+                log.error("PiCamera error stopping recording: %s", exc, exc_info=True)
+            except Exception as exc:
+                log.error("Unexpected error stopping recording: %s", exc, exc_info=True)
+
+    # ── Post-clip bookkeeping ─────────────────────────────────────────────
+    duration = time.monotonic() - start_time
+
+    if filepath.exists():
+        file_mb = filepath.stat().st_size / (1024 * 1024)
+        log.info(
+            "Clip saved: %s  (%.1f s, %.2f MB)",
+            filepath.name,
+            duration,
+            file_mb,
+        )
+        _append_clip_index(filepath, duration, file_mb)
+
+        # Warn if the resulting file is suspiciously small (likely corrupt).
+        if file_mb < 0.01:
+            log.warning(
+                "Clip %s is very small (%.3f MB) – it may be corrupt.",
+                filepath.name,
+                file_mb,
+            )
+    else:
+        log.warning(
+            "Expected clip file not found after recording: %s",
+            filepath,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Entry point: initialise hardware and run the detection/recording loop."""
+    log.info("=" * 60)
+    log.info("Wildlife sensor starting up.")
+    log.info("Videos → %s", VIDEO_DIR)
+    log.info("Free disk: %.1f MB", _free_space_mb(VIDEO_DIR))
+    log.info("=" * 60)
+
+    # Ensure the output directory exists.
+    try:
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.critical("Cannot create video directory %s: %s", VIDEO_DIR, exc)
+        sys.exit(1)
+
+    # ── Initialise PIR ────────────────────────────────────────────────────
+    global pir
+    try:
+        pir = MotionSensor(GPIO_PIN, queue_len=PIR_QUEUE_LEN)
+    except Exception as exc:
+        log.critical(
+            "Could not initialise PIR on GPIO %d: %s",
+            GPIO_PIN,
+            exc,
+            exc_info=True,
+        )
+        sys.exit(1)
+
+    log.info("PIR calibrating on GPIO %d (up to %d s) …", GPIO_PIN, PIR_CALIBRATION_TIMEOUT)
+    try:
+        # Wait for the PIR to report no motion so we don't trigger immediately.
+        pir.wait_for_no_motion(timeout=PIR_CALIBRATION_TIMEOUT)
+        log.info("PIR calibration complete – ready.")
+    except Exception as exc:
+        # Non-fatal: log and continue; the sensor may still work.
+        log.warning(
+            "PIR calibration wait failed (%s) – continuing anyway.", exc
+        )
+
+    log.info("Waiting for motion …")
+
+    # ── Initialise camera ─────────────────────────────────────────────────
+    camera: PiCamera | None = None
+    try:
+        camera = _open_camera()
+    except Exception as exc:
+        log.critical("Cannot open camera: %s", exc, exc_info=True)
+        # Clean up PIR before exit.
+        try:
+            pir.close()
+        except Exception:
+            pass
+        sys.exit(1)
+
+    # ── Main detection / recording loop ───────────────────────────────────
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10  # Give up if the camera keeps failing.
+
+    try:
+        while not _shutdown_requested:
+            try:
+                # wait_for_motion returns None on timeout, True when motion fires.
+                detected = pir.wait_for_motion(timeout=WAIT_MOTION_TIMEOUT)
+            except Exception as exc:
+                log.error("Error waiting for motion: %s", exc, exc_info=True)
+                time.sleep(1.0)
+                continue
+
+            if detected is None:
+                # Timed out – no motion; loop again to check shutdown flag.
+                continue
+
+            # Motion detected – attempt to record a clip.
+            try:
+                record_clip(camera)
+                consecutive_errors = 0
+            except Exception as exc:
+                # record_clip() should not raise, but guard here as a safety net.
+                consecutive_errors += 1
+                log.error(
+                    "record_clip() raised unexpectedly (error %d/%d): %s",
+                    consecutive_errors,
+                    MAX_CONSECUTIVE_ERRORS,
+                    exc,
+                    exc_info=True,
+                )
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    log.critical(
+                        "Too many consecutive errors – shutting down to avoid "
+                        "an infinite error loop."
+                    )
+                    break
+                time.sleep(2.0)
+                continue
+
+            if not _shutdown_requested:
+                log.info("Clip finished – waiting for next motion event …")
+
+    except Exception as exc:
+        log.critical("Unhandled exception in main loop: %s", exc, exc_info=True)
+    finally:
+        # ── Tear-down ─────────────────────────────────────────────────────
+        if camera is not None:
+            try:
+                camera.close()
+                log.info("Camera closed.")
+            except Exception as exc:
+                log.warning("Error closing camera: %s", exc)
+
+        try:
+            pir.close()
+            log.info("PIR closed.")
+        except Exception as exc:
+            log.warning("Error closing PIR: %s", exc)
+
+        log.info("Wildlife sensor shut down cleanly.")
+
+
+if __name__ == "__main__":
+    main()

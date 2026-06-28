@@ -1,0 +1,4 @@
+# Add your dependencies here
+# requests==2.32.3
+# flask==3.0.3
+# fastapi==0.111.0
