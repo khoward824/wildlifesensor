@@ -1,245 +1,455 @@
-#!/usr/bin/env python3
-"""
-wildlifesensor.py
------------------
-Raspberry Pi wildlife camera trap.
+#!/usr/bin/env ts-node
+/**
+ * wildlifesensor.ts
+ * -----------------
+ * Raspberry Pi wildlife camera trap.
+ *
+ * Hardware
+ * --------
+ * - PIR motion sensor on GPIO 4
+ * - Raspberry Pi Camera Module (any revision)
+ *
+ * Behaviour
+ * ---------
+ * 1. Wait for motion.
+ * 2. Start recording an H.264 video file with a timestamp-based name.
+ * 3. Keep recording for at least MIN_RECORD_SECONDS.
+ * 4. Keep recording until motion stops (or MAX_RECORD_SECONDS is reached).
+ * 5. Stop recording, log the clip, then go back to step 1.
+ *
+ * All errors are caught so the sensor keeps running unattended.
+ */
 
-Hardware
---------
-- PIR motion sensor on GPIO 4
-- Raspberry Pi Camera Module (any revision)
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
+import { execSync, spawn, ChildProcess } from "child_process";
 
-Behaviour
----------
-1. Wait for motion.
-2. Start recording an H.264 video file with a timestamp-based name.
-3. Keep recording for at least MIN_RECORD_SECONDS.
-4. Keep recording until motion stops (or MAX_RECORD_SECONDS is reached).
-5. Stop recording, log the clip, then go back to step 1.
+// ---------------------------------------------------------------------------
+// Third-party imports – fail early with a helpful message if missing
+// ---------------------------------------------------------------------------
+let Gpio: any;
+try {
+  Gpio = require("onoff").Gpio;
+} catch (exc) {
+  process.stderr.write(
+    `[FATAL] onoff not available: ${exc}  (run: npm install onoff)\n`
+  );
+  process.exit(1);
+}
 
-All errors are caught so the sensor keeps running unattended.
-"""
+// raspivid is used as the camera interface (ships with Raspberry Pi OS)
+// We verify it exists at startup rather than at import time.
 
-import logging
-import os
-import signal
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
+// ---------------------------------------------------------------------------
+// Configuration – change these without touching the logic below
+// ---------------------------------------------------------------------------
+const GPIO_PIN: number = 4; // BCM pin number for the PIR DATA line
+const PIR_QUEUE_LEN: number = 5; // samples the PIR averages before firing
+const CAMERA_RESOLUTION: [number, number] = [1280, 720];
+const CAMERA_FRAMERATE: number = 30;
+const VIDEO_DIR: string = "/home/pi/wildlife_videos"; // where clips are saved
+const MIN_RECORD_SECONDS: number = 10.0; // always record at least this long
+const MAX_RECORD_SECONDS: number = 300.0; // hard cap so a stuck PIR doesn't fill the disk
+const NO_MOTION_TIMEOUT: number = 30.0; // give up waiting for motion-end after this many s
+const LOG_FILE: string = path.join(VIDEO_DIR, "sensor.log");
+const MIN_FREE_MB: number = 200; // refuse to start a clip if less than this is available
 
-# ---------------------------------------------------------------------------
-# Third-party imports – fail early with a helpful message if missing
-# ---------------------------------------------------------------------------
-try:
-    from gpiozero import MotionSensor
-except ImportError as exc:
-    sys.exit(f"[FATAL] gpiozero not available: {exc}  (run: pip install gpiozero)")
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+function configureLogging(): void {
+  fs.mkdirSync(VIDEO_DIR, { recursive: true });
+}
 
-try:
-    from picamera import PiCamera
-except ImportError as exc:
-    sys.exit(f"[FATAL] picamera not available: {exc}  (run: pip install picamera)")
+function formatLogMessage(level: string, message: string): string {
+  const now = new Date();
+  const dateStr = now.toISOString().replace("T", " ").substring(0, 19);
+  const paddedLevel = level.padEnd(8);
+  return `${dateStr}  ${paddedLevel}  ${message}`;
+}
 
-# ---------------------------------------------------------------------------
-# Configuration – change these without touching the logic below
-# ---------------------------------------------------------------------------
-GPIO_PIN            = 4          # BCM pin number for the PIR DATA line
-PIR_QUEUE_LEN       = 5          # samples the PIR averages before firing
-CAMERA_RESOLUTION   = (1280, 720)
-CAMERA_FRAMERATE    = 30
-VIDEO_DIR           = Path("/home/pi/wildlife_videos")   # where clips are saved
-MIN_RECORD_SECONDS  = 10.0       # always record at least this long
-MAX_RECORD_SECONDS  = 300.0      # hard cap so a stuck PIR doesn't fill the disk
-NO_MOTION_TIMEOUT   = 30.0       # give up waiting for motion-end after this many s
-LOG_FILE            = VIDEO_DIR / "sensor.log"
+function log(level: "INFO" | "WARNING" | "ERROR" | "CRITICAL", message: string): void {
+  const formatted = formatLogMessage(level, message);
+  process.stdout.write(formatted + "\n");
+  try {
+    fs.appendFileSync(LOG_FILE, formatted + "\n");
+  } catch {
+    // If we can't write to log file, continue anyway
+  }
+}
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-def _configure_logging() -> logging.Logger:
-    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    fmt = "%(asctime)s  %(levelname)-8s  %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    handlers: list[logging.Handler] = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE),
-    ]
-    logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt,
-                        handlers=handlers)
-    return logging.getLogger("wildlifesensor")
+const logger = {
+  info: (message: string) => log("INFO", message),
+  warning: (message: string) => log("WARNING", message),
+  error: (message: string) => log("ERROR", message),
+  critical: (message: string) => log("CRITICAL", message),
+};
 
-log = _configure_logging()
+// ---------------------------------------------------------------------------
+// Graceful shutdown on SIGINT / SIGTERM
+// ---------------------------------------------------------------------------
+let _shutdownRequested: boolean = false;
 
-# ---------------------------------------------------------------------------
-# Graceful shutdown on SIGINT / SIGTERM
-# ---------------------------------------------------------------------------
-_shutdown_requested = False
+function handleSignal(signal: string): void {
+  logger.info(
+    `Shutdown signal ${signal} received – finishing current clip then exiting.`
+  );
+  _shutdownRequested = true;
+}
 
-def _handle_signal(signum, _frame):
-    global _shutdown_requested
-    log.info("Shutdown signal %s received – finishing current clip then exiting.",
-             signal.Signals(signum).name)
-    _shutdown_requested = True
+process.on("SIGINT", () => handleSignal("SIGINT"));
+process.on("SIGTERM", () => handleSignal("SIGTERM"));
 
-signal.signal(signal.SIGINT,  _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _make_filename(directory: Path) -> Path:
-    """Return a unique timestamped H.264 path inside *directory*."""
-    now = datetime.now()
-    name = now.strftime("%Y-%m-%d_%H-%M-%S") + ".h264"
-    return directory / name
+/** Return a unique timestamped H.264 path inside directory. */
+function makeFilename(directory: string): string {
+  const now = new Date();
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  const year = now.getFullYear();
+  const month = pad(now.getMonth() + 1);
+  const day = pad(now.getDate());
+  const hours = pad(now.getHours());
+  const minutes = pad(now.getMinutes());
+  const seconds = pad(now.getSeconds());
+  const name = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.h264`;
+  return path.join(directory, name);
+}
 
+/** Return free disk space in MB for the filesystem containing path. */
+function freeSpaceMb(dirPath: string): number {
+  try {
+    // df -k outputs 1K-blocks; we want bytes
+    const output = execSync(`df -k "${dirPath}"`, { encoding: "utf8" });
+    const lines = output.trim().split("\n");
+    if (lines.length >= 2) {
+      const parts = lines[1].split(/\s+/);
+      // column 3 is "Available" in 1K-blocks
+      const availableKb = parseInt(parts[3], 10);
+      return (availableKb * 1024) / (1024 * 1024);
+    }
+  } catch {
+    // If df fails, assume enough space
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
 
-def _free_space_mb(path: Path) -> float:
-    """Return free disk space in MB for the filesystem containing *path*."""
-    stat = os.statvfs(path)
-    return (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+function enoughDiskSpace(): boolean {
+  const free = freeSpaceMb(VIDEO_DIR);
+  if (free < MIN_FREE_MB) {
+    logger.warning(
+      `Low disk space: ${free.toFixed(1)} MB free (need ${MIN_FREE_MB} MB) – skipping clip.`
+    );
+    return false;
+  }
+  return true;
+}
 
+/** Return current high-resolution time in seconds (monotonic equivalent). */
+function monotonicSeconds(): number {
+  const [sec, nanosec] = process.hrtime();
+  return sec + nanosec / 1e9;
+}
 
-MIN_FREE_MB = 200  # refuse to start a clip if less than this is available
+/** Sleep for the given number of milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+// ---------------------------------------------------------------------------
+// PIR Motion Sensor with debounce queue
+// ---------------------------------------------------------------------------
+class MotionSensor {
+  private pin: Gpio;
+  private queueLen: number;
+  private queue: number[];
+  private _motionDetected: boolean;
+  private watchCallback: ((value: number) => void) | null;
 
-def _enough_disk_space() -> bool:
-    free = _free_space_mb(VIDEO_DIR)
-    if free < MIN_FREE_MB:
-        log.warning("Low disk space: %.1f MB free (need %d MB) – skipping clip.",
-                    free, MIN_FREE_MB)
-        return False
-    return True
+  constructor(gpioPin: number, queueLen: number) {
+    this.queueLen = queueLen;
+    this.queue = new Array(queueLen).fill(0);
+    this._motionDetected = false;
+    this.watchCallback = null;
 
+    this.pin = new Gpio(gpioPin, "in", "both");
+    this.pin.watch((err: Error | null, value: number) => {
+      if (err) {
+        logger.error(`GPIO watch error: ${err.message}`);
+        return;
+      }
+      this.queue.push(value);
+      this.queue.shift();
+      const avg = this.queue.reduce((a, b) => a + b, 0) / this.queueLen;
+      this._motionDetected = avg > 0.5;
+    });
+  }
 
-# ---------------------------------------------------------------------------
-# Camera context manager
-# ---------------------------------------------------------------------------
-def _open_camera() -> PiCamera:
-    camera = PiCamera()
-    camera.resolution  = CAMERA_RESOLUTION
-    camera.framerate   = CAMERA_FRAMERATE
-    # Brief warm-up so the sensor auto-exposure settles
-    camera.start_preview()
-    time.sleep(2)
-    camera.stop_preview()
-    log.info("Camera initialised at %dx%d @ %d fps.",
-             CAMERA_RESOLUTION[0], CAMERA_RESOLUTION[1], CAMERA_FRAMERATE)
-    return camera
+  get motionDetected(): boolean {
+    // Also read current value directly for up-to-date state
+    try {
+      const val = this.pin.readSync();
+      this.queue.push(val);
+      this.queue.shift();
+      const avg = this.queue.reduce((a, b) => a + b, 0) / this.queueLen;
+      this._motionDetected = avg > 0.5;
+    } catch {
+      // Return last known state if read fails
+    }
+    return this._motionDetected;
+  }
 
+  /** Wait for motion. Resolves true if motion detected, null if timed out. */
+  async waitForMotion(timeoutSeconds: number): Promise<true | null> {
+    const deadline = monotonicSeconds() + timeoutSeconds;
+    while (monotonicSeconds() < deadline) {
+      if (this.motionDetected) {
+        return true;
+      }
+      await sleep(100);
+    }
+    return null;
+  }
 
-# ---------------------------------------------------------------------------
-# Core recording logic
-# ---------------------------------------------------------------------------
-def record_clip(camera: PiCamera) -> None:
-    """Record one motion-triggered clip."""
-    if not _enough_disk_space():
-        return
+  /** Wait until no motion is detected, up to timeoutSeconds. */
+  async waitForNoMotion(timeoutSeconds: number): Promise<void> {
+    const deadline = monotonicSeconds() + timeoutSeconds;
+    while (monotonicSeconds() < deadline) {
+      if (!this.motionDetected) {
+        return;
+      }
+      await sleep(100);
+    }
+  }
 
-    filepath = _make_filename(VIDEO_DIR)
-    log.info("Motion detected – recording → %s", filepath.name)
+  unexport(): void {
+    try {
+      this.pin.unexport();
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
 
-    start_time = time.monotonic()
-    recording  = False
+// ---------------------------------------------------------------------------
+// Camera management via raspivid
+// ---------------------------------------------------------------------------
+class PiCamera {
+  private recordingProcess: ChildProcess | null = null;
+  private _isRecording: boolean = false;
 
-    try:
-        camera.start_recording(str(filepath))
-        recording = True
+  constructor() {
+    // Verify raspivid is available
+    try {
+      execSync("which raspivid", { encoding: "utf8" });
+    } catch {
+      throw new Error(
+        "raspivid not found. Ensure Raspberry Pi Camera is enabled and raspivid is installed."
+      );
+    }
+  }
 
-        # ── Minimum buffer ──────────────────────────────────────────────────
-        elapsed = 0.0
-        while elapsed < MIN_RECORD_SECONDS:
-            if _shutdown_requested:
-                break
-            time.sleep(0.1)
-            elapsed = time.monotonic() - start_time
+  /** Brief warm-up so the sensor auto-exposure settles. */
+  async warmUp(): Promise<void> {
+    logger.info(
+      `Camera initialised at ${CAMERA_RESOLUTION[0]}x${CAMERA_RESOLUTION[1]} @ ${CAMERA_FRAMERATE} fps.`
+    );
+    // Use raspistill in preview-only mode briefly, or just sleep
+    await sleep(2000);
+  }
 
-        # ── Wait for motion to stop (with hard cap) ──────────────────────
-        if not _shutdown_requested:
-            motion_end_deadline = time.monotonic() + NO_MOTION_TIMEOUT
-            max_deadline        = start_time + MAX_RECORD_SECONDS
+  /** Start recording to the given filepath. */
+  startRecording(filepath: string): void {
+    if (this._isRecording) {
+      throw new Error("Already recording.");
+    }
+    this.recordingProcess = spawn("raspivid", [
+      "-o", filepath,
+      "-w", String(CAMERA_RESOLUTION[0]),
+      "-h", String(CAMERA_RESOLUTION[1]),
+      "-fps", String(CAMERA_FRAMERATE),
+      "-t", "0", // record indefinitely until stopped
+      "-n",      // no preview
+    ]);
 
-            while not _shutdown_requested:
-                now_mono = time.monotonic()
+    this.recordingProcess.on("error", (err: Error) => {
+      logger.error(`raspivid process error: ${err.message}`);
+    });
 
-                if now_mono >= max_deadline:
-                    log.warning("Max recording duration (%ds) reached – stopping.",
-                                MAX_RECORD_SECONDS)
-                    break
+    this.recordingProcess.on("exit", (code: number | null) => {
+      if (code !== null && code !== 0) {
+        logger.warning(`raspivid exited with code ${code}`);
+      }
+      this._isRecording = false;
+      this.recordingProcess = null;
+    });
 
-                # pir.motion_detected reflects the current debounced state
-                if not pir.motion_detected:
-                    if now_mono >= motion_end_deadline:
-                        break           # motion has been absent long enough
-                else:
-                    # Motion still ongoing – reset the no-motion deadline
-                    motion_end_deadline = time.monotonic() + NO_MOTION_TIMEOUT
+    this._isRecording = true;
+  }
 
-                time.sleep(0.1)
+  /** Stop the current recording. */
+  stopRecording(): void {
+    if (this.recordingProcess && this._isRecording) {
+      this.recordingProcess.kill("SIGTERM");
+      this._isRecording = false;
+    }
+  }
 
-    except Exception as exc:
-        log.error("Error during recording: %s", exc, exc_info=True)
-    finally:
-        if recording:
-            try:
-                camera.stop_recording()
-            except Exception as exc:
-                log.error("Error stopping recording: %s", exc, exc_info=True)
+  get isRecording(): boolean {
+    return this._isRecording;
+  }
 
-    duration = time.monotonic() - start_time
-    file_mb  = filepath.stat().st_size / (1024 * 1024) if filepath.exists() else 0.0
-    log.info("Clip saved: %s  (%.1f s, %.2f MB)", filepath.name, duration, file_mb)
+  close(): void {
+    this.stopRecording();
+  }
+}
 
+// ---------------------------------------------------------------------------
+// Core recording logic
+// ---------------------------------------------------------------------------
+// pir is declared here so record_clip can access it (matches Python global usage)
+let pir: MotionSensor;
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-def main() -> None:
-    log.info("Wildlife sensor starting up.  Videos → %s", VIDEO_DIR)
+async function recordClip(camera: PiCamera): Promise<void> {
+  if (!enoughDiskSpace()) {
+    return;
+  }
 
-    # Initialise PIR
-    try:
-        global pir
-        pir = MotionSensor(GPIO_PIN, queue_len=PIR_QUEUE_LEN)
-    except Exception as exc:
-        log.critical("Could not initialise PIR on GPIO %d: %s", GPIO_PIN, exc,
-                     exc_info=True)
-        sys.exit(1)
+  const filepath = makeFilename(VIDEO_DIR);
+  const filenameOnly = path.basename(filepath);
+  logger.info(`Motion detected – recording → ${filenameOnly}`);
 
-    log.info("PIR calibrating on GPIO %d …", GPIO_PIN)
-    # Allow the PIR sensor to settle before we start listening
-    pir.wait_for_no_motion(timeout=30)
-    log.info("PIR ready.  Waiting for motion …")
+  const startTime = monotonicSeconds();
+  let recording = false;
 
-    camera: PiCamera | None = None
-    try:
-        camera = _open_camera()
+  try {
+    camera.startRecording(filepath);
+    recording = true;
 
-        while not _shutdown_requested:
-            # wait_for_motion accepts a timeout so we can check _shutdown_requested
-            detected = pir.wait_for_motion(timeout=5)
-            if detected is None:
-                # Timed out – no motion; loop again to check shutdown flag
-                continue
+    // ── Minimum buffer ──────────────────────────────────────────────────
+    let elapsed = 0.0;
+    while (elapsed < MIN_RECORD_SECONDS) {
+      if (_shutdownRequested) {
+        break;
+      }
+      await sleep(100);
+      elapsed = monotonicSeconds() - startTime;
+    }
 
-            record_clip(camera)
+    // ── Wait for motion to stop (with hard cap) ──────────────────────
+    if (!_shutdownRequested) {
+      let motionEndDeadline = monotonicSeconds() + NO_MOTION_TIMEOUT;
+      const maxDeadline = startTime + MAX_RECORD_SECONDS;
 
-            if not _shutdown_requested:
-                log.info("Motion ended – waiting for next event …")
+      while (!_shutdownRequested) {
+        const nowMono = monotonicSeconds();
 
-    except Exception as exc:
-        log.critical("Unhandled exception in main loop: %s", exc, exc_info=True)
-        sys.exit(1)
-    finally:
-        if camera is not None:
-            try:
-                camera.close()
-                log.info("Camera closed.")
-            except Exception:
-                pass
-        log.info("Wildlife sensor shut down cleanly.")
+        if (nowMono >= maxDeadline) {
+          logger.warning(
+            `Max recording duration (${MAX_RECORD_SECONDS}s) reached – stopping.`
+          );
+          break;
+        }
 
+        // pir.motionDetected reflects the current debounced state
+        if (!pir.motionDetected) {
+          if (nowMono >= motionEndDeadline) {
+            break; // motion has been absent long enough
+          }
+        } else {
+          // Motion still ongoing – reset the no-motion deadline
+          motionEndDeadline = monotonicSeconds() + NO_MOTION_TIMEOUT;
+        }
 
-if __name__ == "__main__":
-    main()
+        await sleep(100);
+      }
+    }
+  } catch (exc) {
+    logger.error(`Error during recording: ${exc}`);
+  } finally {
+    if (recording) {
+      try {
+        camera.stopRecording();
+      } catch (exc) {
+        logger.error(`Error stopping recording: ${exc}`);
+      }
+    }
+  }
+
+  const duration = monotonicSeconds() - startTime;
+  let fileMb = 0.0;
+  try {
+    if (fs.existsSync(filepath)) {
+      const stat = fs.statSync(filepath);
+      fileMb = stat.size / (1024 * 1024);
+    }
+  } catch {
+    // Leave fileMb as 0
+  }
+  logger.info(
+    `Clip saved: ${filenameOnly}  (${duration.toFixed(1)} s, ${fileMb.toFixed(2)} MB)`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+async function main(): Promise<void> {
+  configureLogging();
+  logger.info(`Wildlife sensor starting up.  Videos → ${VIDEO_DIR}`);
+
+  // Initialise PIR
+  try {
+    pir = new MotionSensor(GPIO_PIN, PIR_QUEUE_LEN);
+  } catch (exc) {
+    logger.critical(`Could not initialise PIR on GPIO ${GPIO_PIN}: ${exc}`);
+    process.exit(1);
+  }
+
+  logger.info(`PIR calibrating on GPIO ${GPIO_PIN} …`);
+  // Allow the PIR sensor to settle before we start listening
+  await pir.waitForNoMotion(30);
+  logger.info("PIR ready.  Waiting for motion …");
+
+  let camera: PiCamera | null = null;
+  try {
+    camera = new PiCamera();
+    await camera.warmUp();
+
+    while (!_shutdownRequested) {
+      // waitForMotion accepts a timeout so we can check _shutdownRequested
+      const detected = await pir.waitForMotion(5);
+      if (detected === null) {
+        // Timed out – no motion; loop again to check shutdown flag
+        continue;
+      }
+
+      await recordClip(camera);
+
+      if (!_shutdownRequested) {
+        logger.info("Motion ended – waiting for next event …");
+      }
+    }
+  } catch (exc) {
+    logger.critical(`Unhandled exception in main loop: ${exc}`);
+    process.exit(1);
+  } finally {
+    if (camera !== null) {
+      try {
+        camera.close();
+        logger.info("Camera closed.");
+      } catch {
+        // Ignore
+      }
+    }
+    if (pir) {
+      pir.unexport();
+    }
+    logger.info("Wildlife sensor shut down cleanly.");
+  }
+}
+
+main();
