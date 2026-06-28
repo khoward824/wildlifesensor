@@ -1,326 +1,167 @@
-#!/usr/bin/env ts-node
-/**
- * wildlifesensor.ts
- * -----------------
- * Raspberry Pi wildlife camera trap.
- *
- * Hardware
- * --------
- * - PIR motion sensor on GPIO 4
- * - Raspberry Pi Camera Module (any revision)
- *
- * Behaviour
- * ---------
- * 1. Wait for motion.
- * 2. Start recording an H.264 video file with a timestamp-based name.
- * 3. Keep recording for at least MIN_RECORD_SECONDS.
- * 4. Keep recording until motion stops (or MAX_RECORD_SECONDS is reached).
- * 5. Stop recording, log the clip, then go back to step 1.
- *
- * All errors are caught so the sensor keeps running unattended.
- */
-
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
-import { execSync, spawn, ChildProcess } from "child_process";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 
 // ---------------------------------------------------------------------------
-// Third-party imports – fail early with a helpful message if missing
+// Configuration – mirrors the original constants
 // ---------------------------------------------------------------------------
-let Gpio: any;
-try {
-  Gpio = require("onoff").Gpio;
-} catch (exc) {
-  process.stderr.write(
-    `[FATAL] onoff not available: ${exc}  (run: npm install onoff)\n`
-  );
-  process.exit(1);
-}
-
-// raspivid is used as the camera interface (ships with Raspberry Pi OS)
-// We verify it exists at startup rather than at import time.
+const GPIO_PIN = 4;
+const PIR_QUEUE_LEN = 5;
+const CAMERA_RESOLUTION = [1280, 720];
+const CAMERA_FRAMERATE = 30;
+const VIDEO_DIR = "/home/pi/wildlife_videos";
+const MIN_RECORD_SECONDS = 10.0;
+const MAX_RECORD_SECONDS = 300.0;
+const NO_MOTION_TIMEOUT = 30.0;
+const LOG_FILE = `${VIDEO_DIR}/sensor.log`;
+const MIN_FREE_MB = 200;
 
 // ---------------------------------------------------------------------------
-// Configuration – change these without touching the logic below
+// Utility helpers (pure functions, no React dependency)
 // ---------------------------------------------------------------------------
-const GPIO_PIN: number = 4; // BCM pin number for the PIR DATA line
-const PIR_QUEUE_LEN: number = 5; // samples the PIR averages before firing
-const CAMERA_RESOLUTION: [number, number] = [1280, 720];
-const CAMERA_FRAMERATE: number = 30;
-const VIDEO_DIR: string = "/home/pi/wildlife_videos"; // where clips are saved
-const MIN_RECORD_SECONDS: number = 10.0; // always record at least this long
-const MAX_RECORD_SECONDS: number = 300.0; // hard cap so a stuck PIR doesn't fill the disk
-const NO_MOTION_TIMEOUT: number = 30.0; // give up waiting for motion-end after this many s
-const LOG_FILE: string = path.join(VIDEO_DIR, "sensor.log");
-const MIN_FREE_MB: number = 200; // refuse to start a clip if less than this is available
 
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
-function configureLogging(): void {
-  fs.mkdirSync(VIDEO_DIR, { recursive: true });
-}
-
-function formatLogMessage(level: string, message: string): string {
+function formatLogMessage(level, message) {
   const now = new Date();
   const dateStr = now.toISOString().replace("T", " ").substring(0, 19);
   const paddedLevel = level.padEnd(8);
   return `${dateStr}  ${paddedLevel}  ${message}`;
 }
 
-function log(level: "INFO" | "WARNING" | "ERROR" | "CRITICAL", message: string): void {
-  const formatted = formatLogMessage(level, message);
-  process.stdout.write(formatted + "\n");
-  try {
-    fs.appendFileSync(LOG_FILE, formatted + "\n");
-  } catch {
-    // If we can't write to log file, continue anyway
-  }
-}
-
-const logger = {
-  info: (message: string) => log("INFO", message),
-  warning: (message: string) => log("WARNING", message),
-  error: (message: string) => log("ERROR", message),
-  critical: (message: string) => log("CRITICAL", message),
-};
-
-// ---------------------------------------------------------------------------
-// Graceful shutdown on SIGINT / SIGTERM
-// ---------------------------------------------------------------------------
-let _shutdownRequested: boolean = false;
-
-function handleSignal(signal: string): void {
-  logger.info(
-    `Shutdown signal ${signal} received – finishing current clip then exiting.`
-  );
-  _shutdownRequested = true;
-}
-
-process.on("SIGINT", () => handleSignal("SIGINT"));
-process.on("SIGTERM", () => handleSignal("SIGTERM"));
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Return a unique timestamped H.264 path inside directory. */
-function makeFilename(directory: string): string {
+function makeFilename() {
   const now = new Date();
-  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  const pad = (n, len = 2) => String(n).padStart(len, "0");
   const year = now.getFullYear();
   const month = pad(now.getMonth() + 1);
   const day = pad(now.getDate());
   const hours = pad(now.getHours());
   const minutes = pad(now.getMinutes());
   const seconds = pad(now.getSeconds());
-  const name = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.h264`;
-  return path.join(directory, name);
+  return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.h264`;
 }
 
-/** Return free disk space in MB for the filesystem containing path. */
-function freeSpaceMb(dirPath: string): number {
-  try {
-    // df -k outputs 1K-blocks; we want bytes
-    const output = execSync(`df -k "${dirPath}"`, { encoding: "utf8" });
-    const lines = output.trim().split("\n");
-    if (lines.length >= 2) {
-      const parts = lines[1].split(/\s+/);
-      // column 3 is "Available" in 1K-blocks
-      const availableKb = parseInt(parts[3], 10);
-      return (availableKb * 1024) / (1024 * 1024);
-    }
-  } catch {
-    // If df fails, assume enough space
-  }
-  return Number.MAX_SAFE_INTEGER;
+function monotonicSeconds() {
+  return performance.now() / 1000;
 }
 
-function enoughDiskSpace(): boolean {
-  const free = freeSpaceMb(VIDEO_DIR);
-  if (free < MIN_FREE_MB) {
-    logger.warning(
-      `Low disk space: ${free.toFixed(1)} MB free (need ${MIN_FREE_MB} MB) – skipping clip.`
-    );
-    return false;
-  }
-  return true;
-}
-
-/** Return current high-resolution time in seconds (monotonic equivalent). */
-function monotonicSeconds(): number {
-  const [sec, nanosec] = process.hrtime();
-  return sec + nanosec / 1e9;
-}
-
-/** Sleep for the given number of milliseconds. */
-function sleep(ms: number): Promise<void> {
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
-// PIR Motion Sensor with debounce queue
+// Simulated hardware state (replaces GPIO / raspivid / disk checks)
+// In the original these are real OS calls; here they are UI-controllable
+// ---------------------------------------------------------------------------
+
+// Shared mutable refs passed down from the component:
+//   pirValueRef     – current raw PIR pin value (0 or 1), toggled by UI
+//   diskFreeRef     – simulated free MB, editable by UI
+//   recordingFileRef – name of current clip being "recorded"
+//   isRecordingRef  – whether raspivid subprocess is "running"
+
+// ---------------------------------------------------------------------------
+// MotionSensor class – identical logic to original, hardware reads replaced
 // ---------------------------------------------------------------------------
 class MotionSensor {
-  private pin: Gpio;
-  private queueLen: number;
-  private queue: number[];
-  private _motionDetected: boolean;
-  private watchCallback: ((value: number) => void) | null;
-
-  constructor(gpioPin: number, queueLen: number) {
+  constructor(queueLen, pirValueRef) {
     this.queueLen = queueLen;
     this.queue = new Array(queueLen).fill(0);
     this._motionDetected = false;
-    this.watchCallback = null;
-
-    this.pin = new Gpio(gpioPin, "in", "both");
-    this.pin.watch((err: Error | null, value: number) => {
-      if (err) {
-        logger.error(`GPIO watch error: ${err.message}`);
-        return;
-      }
-      this.queue.push(value);
-      this.queue.shift();
-      const avg = this.queue.reduce((a, b) => a + b, 0) / this.queueLen;
-      this._motionDetected = avg > 0.5;
-    });
+    this.pirValueRef = pirValueRef; // { current: 0|1 }
   }
 
-  get motionDetected(): boolean {
-    // Also read current value directly for up-to-date state
-    try {
-      const val = this.pin.readSync();
-      this.queue.push(val);
-      this.queue.shift();
-      const avg = this.queue.reduce((a, b) => a + b, 0) / this.queueLen;
-      this._motionDetected = avg > 0.5;
-    } catch {
-      // Return last known state if read fails
-    }
+  // Mirrors the getter: reads current value, updates queue, returns debounced bool
+  get motionDetected() {
+    const val = this.pirValueRef.current;
+    this.queue.push(val);
+    this.queue.shift();
+    const avg = this.queue.reduce((a, b) => a + b, 0) / this.queueLen;
+    this._motionDetected = avg > 0.5;
     return this._motionDetected;
   }
 
-  /** Wait for motion. Resolves true if motion detected, null if timed out. */
-  async waitForMotion(timeoutSeconds: number): Promise<true | null> {
+  async waitForMotion(timeoutSeconds) {
     const deadline = monotonicSeconds() + timeoutSeconds;
     while (monotonicSeconds() < deadline) {
-      if (this.motionDetected) {
-        return true;
-      }
+      if (this.motionDetected) return true;
       await sleep(100);
     }
     return null;
   }
 
-  /** Wait until no motion is detected, up to timeoutSeconds. */
-  async waitForNoMotion(timeoutSeconds: number): Promise<void> {
+  async waitForNoMotion(timeoutSeconds) {
     const deadline = monotonicSeconds() + timeoutSeconds;
     while (monotonicSeconds() < deadline) {
-      if (!this.motionDetected) {
-        return;
-      }
+      if (!this.motionDetected) return;
       await sleep(100);
     }
   }
 
-  unexport(): void {
-    try {
-      this.pin.unexport();
-    } catch {
-      // Ignore cleanup errors
-    }
+  unexport() {
+    // No real GPIO to release in the browser
   }
 }
 
 // ---------------------------------------------------------------------------
-// Camera management via raspivid
+// PiCamera class – identical logic, raspivid replaced with simulation
 // ---------------------------------------------------------------------------
 class PiCamera {
-  private recordingProcess: ChildProcess | null = null;
-  private _isRecording: boolean = false;
-
-  constructor() {
-    // Verify raspivid is available
-    try {
-      execSync("which raspivid", { encoding: "utf8" });
-    } catch {
-      throw new Error(
-        "raspivid not found. Ensure Raspberry Pi Camera is enabled and raspivid is installed."
-      );
-    }
+  constructor(recordingFileRef, isRecordingRef) {
+    this.recordingFileRef = recordingFileRef;
+    this.isRecordingRef = isRecordingRef;
+    this._isRecording = false;
   }
 
-  /** Brief warm-up so the sensor auto-exposure settles. */
-  async warmUp(): Promise<void> {
-    logger.info(
-      `Camera initialised at ${CAMERA_RESOLUTION[0]}x${CAMERA_RESOLUTION[1]} @ ${CAMERA_FRAMERATE} fps.`
-    );
-    // Use raspistill in preview-only mode briefly, or just sleep
+  async warmUp() {
+    // Mirrors the 2-second warm-up sleep
     await sleep(2000);
   }
 
-  /** Start recording to the given filepath. */
-  startRecording(filepath: string): void {
-    if (this._isRecording) {
-      throw new Error("Already recording.");
-    }
-    this.recordingProcess = spawn("raspivid", [
-      "-o", filepath,
-      "-w", String(CAMERA_RESOLUTION[0]),
-      "-h", String(CAMERA_RESOLUTION[1]),
-      "-fps", String(CAMERA_FRAMERATE),
-      "-t", "0", // record indefinitely until stopped
-      "-n",      // no preview
-    ]);
-
-    this.recordingProcess.on("error", (err: Error) => {
-      logger.error(`raspivid process error: ${err.message}`);
-    });
-
-    this.recordingProcess.on("exit", (code: number | null) => {
-      if (code !== null && code !== 0) {
-        logger.warning(`raspivid exited with code ${code}`);
-      }
-      this._isRecording = false;
-      this.recordingProcess = null;
-    });
-
+  startRecording(filepath) {
+    if (this._isRecording) throw new Error("Already recording.");
     this._isRecording = true;
+    this.isRecordingRef.current = true;
+    this.recordingFileRef.current = filepath;
   }
 
-  /** Stop the current recording. */
-  stopRecording(): void {
-    if (this.recordingProcess && this._isRecording) {
-      this.recordingProcess.kill("SIGTERM");
+  stopRecording() {
+    if (this._isRecording) {
       this._isRecording = false;
+      this.isRecordingRef.current = false;
+      this.recordingFileRef.current = null;
     }
   }
 
-  get isRecording(): boolean {
+  get isRecording() {
     return this._isRecording;
   }
 
-  close(): void {
+  close() {
     this.stopRecording();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Core recording logic
+// Core recording logic – exact translation of recordClip()
 // ---------------------------------------------------------------------------
-// pir is declared here so record_clip can access it (matches Python global usage)
-let pir: MotionSensor;
-
-async function recordClip(camera: PiCamera): Promise<void> {
-  if (!enoughDiskSpace()) {
+async function recordClip(
+  camera,
+  pir,
+  diskFreeRef,
+  shutdownRef,
+  addLog,
+  addClip
+) {
+  // enoughDiskSpace() inlined
+  const free = diskFreeRef.current;
+  if (free < MIN_FREE_MB) {
+    addLog(
+      "WARNING",
+      `Low disk space: ${free.toFixed(1)} MB free (need ${MIN_FREE_MB} MB) – skipping clip.`
+    );
     return;
   }
 
-  const filepath = makeFilename(VIDEO_DIR);
-  const filenameOnly = path.basename(filepath);
-  logger.info(`Motion detected – recording → ${filenameOnly}`);
+  const filenameOnly = makeFilename();
+  const filepath = `${VIDEO_DIR}/${filenameOnly}`;
+  addLog("INFO", `Motion detected – recording → ${filenameOnly}`);
 
   const startTime = monotonicSeconds();
   let recording = false;
@@ -332,35 +173,30 @@ async function recordClip(camera: PiCamera): Promise<void> {
     // ── Minimum buffer ──────────────────────────────────────────────────
     let elapsed = 0.0;
     while (elapsed < MIN_RECORD_SECONDS) {
-      if (_shutdownRequested) {
-        break;
-      }
+      if (shutdownRef.current) break;
       await sleep(100);
       elapsed = monotonicSeconds() - startTime;
     }
 
     // ── Wait for motion to stop (with hard cap) ──────────────────────
-    if (!_shutdownRequested) {
+    if (!shutdownRef.current) {
       let motionEndDeadline = monotonicSeconds() + NO_MOTION_TIMEOUT;
       const maxDeadline = startTime + MAX_RECORD_SECONDS;
 
-      while (!_shutdownRequested) {
+      while (!shutdownRef.current) {
         const nowMono = monotonicSeconds();
 
         if (nowMono >= maxDeadline) {
-          logger.warning(
+          addLog(
+            "WARNING",
             `Max recording duration (${MAX_RECORD_SECONDS}s) reached – stopping.`
           );
           break;
         }
 
-        // pir.motionDetected reflects the current debounced state
         if (!pir.motionDetected) {
-          if (nowMono >= motionEndDeadline) {
-            break; // motion has been absent long enough
-          }
+          if (nowMono >= motionEndDeadline) break;
         } else {
-          // Motion still ongoing – reset the no-motion deadline
           motionEndDeadline = monotonicSeconds() + NO_MOTION_TIMEOUT;
         }
 
@@ -368,88 +204,424 @@ async function recordClip(camera: PiCamera): Promise<void> {
       }
     }
   } catch (exc) {
-    logger.error(`Error during recording: ${exc}`);
+    addLog("ERROR", `Error during recording: ${exc}`);
   } finally {
     if (recording) {
       try {
         camera.stopRecording();
       } catch (exc) {
-        logger.error(`Error stopping recording: ${exc}`);
+        addLog("ERROR", `Error stopping recording: ${exc}`);
       }
     }
   }
 
   const duration = monotonicSeconds() - startTime;
-  let fileMb = 0.0;
-  try {
-    if (fs.existsSync(filepath)) {
-      const stat = fs.statSync(filepath);
-      fileMb = stat.size / (1024 * 1024);
-    }
-  } catch {
-    // Leave fileMb as 0
-  }
-  logger.info(
-    `Clip saved: ${filenameOnly}  (${duration.toFixed(1)} s, ${fileMb.toFixed(2)} MB)`
+  // Simulated file size: CAMERA_FRAMERATE * resolution * bitrate estimate
+  const fileMb = ((duration * CAMERA_FRAMERATE * 0.5) / 1024).toFixed(2);
+  addLog(
+    "INFO",
+    `Clip saved: ${filenameOnly}  (${duration.toFixed(1)} s, ${fileMb} MB)`
   );
+  addClip({ name: filenameOnly, duration: duration.toFixed(1), size: fileMb });
 }
 
 // ---------------------------------------------------------------------------
-// Main loop
+// Main loop – exact translation of main()
 // ---------------------------------------------------------------------------
-async function main(): Promise<void> {
-  configureLogging();
-  logger.info(`Wildlife sensor starting up.  Videos → ${VIDEO_DIR}`);
+async function runSensor(
+  pirValueRef,
+  diskFreeRef,
+  shutdownRef,
+  addLog,
+  addClip,
+  setStatus
+) {
+  addLog("INFO", `Wildlife sensor starting up.  Videos → ${VIDEO_DIR}`);
+  setStatus("Initialising PIR…");
 
-  // Initialise PIR
+  let pir;
   try {
-    pir = new MotionSensor(GPIO_PIN, PIR_QUEUE_LEN);
+    pir = new MotionSensor(PIR_QUEUE_LEN, pirValueRef);
   } catch (exc) {
-    logger.critical(`Could not initialise PIR on GPIO ${GPIO_PIN}: ${exc}`);
-    process.exit(1);
+    addLog("CRITICAL", `Could not initialise PIR on GPIO ${GPIO_PIN}: ${exc}`);
+    setStatus("FATAL: PIR init failed");
+    return;
   }
 
-  logger.info(`PIR calibrating on GPIO ${GPIO_PIN} …`);
-  // Allow the PIR sensor to settle before we start listening
+  addLog("INFO", `PIR calibrating on GPIO ${GPIO_PIN} …`);
+  setStatus("PIR calibrating…");
   await pir.waitForNoMotion(30);
-  logger.info("PIR ready.  Waiting for motion …");
+  addLog("INFO", "PIR ready.  Waiting for motion …");
+  setStatus("Waiting for motion…");
 
-  let camera: PiCamera | null = null;
+  let camera = null;
   try {
-    camera = new PiCamera();
+    const recordingFileRef = { current: null };
+    const isRecordingRef = { current: false };
+    camera = new PiCamera(recordingFileRef, isRecordingRef);
+    addLog(
+      "INFO",
+      `Camera initialised at ${CAMERA_RESOLUTION[0]}x${CAMERA_RESOLUTION[1]} @ ${CAMERA_FRAMERATE} fps.`
+    );
+    setStatus("Camera warming up…");
     await camera.warmUp();
+    setStatus("Waiting for motion…");
 
-    while (!_shutdownRequested) {
-      // waitForMotion accepts a timeout so we can check _shutdownRequested
+    while (!shutdownRef.current) {
       const detected = await pir.waitForMotion(5);
-      if (detected === null) {
-        // Timed out – no motion; loop again to check shutdown flag
-        continue;
-      }
+      if (detected === null) continue; // timeout – loop to check shutdown flag
 
-      await recordClip(camera);
+      setStatus("Recording…");
+      await recordClip(camera, pir, diskFreeRef, shutdownRef, addLog, addClip);
 
-      if (!_shutdownRequested) {
-        logger.info("Motion ended – waiting for next event …");
+      if (!shutdownRef.current) {
+        addLog("INFO", "Motion ended – waiting for next event …");
+        setStatus("Waiting for motion…");
       }
     }
   } catch (exc) {
-    logger.critical(`Unhandled exception in main loop: ${exc}`);
-    process.exit(1);
+    addLog("CRITICAL", `Unhandled exception in main loop: ${exc}`);
+    setStatus("FATAL error – see log");
   } finally {
     if (camera !== null) {
       try {
         camera.close();
-        logger.info("Camera closed.");
+        addLog("INFO", "Camera closed.");
       } catch {
-        // Ignore
+        // ignore
       }
     }
-    if (pir) {
-      pir.unexport();
-    }
-    logger.info("Wildlife sensor shut down cleanly.");
+    if (pir) pir.unexport();
+    addLog("INFO", "Wildlife sensor shut down cleanly.");
+    setStatus("Shut down.");
   }
 }
 
-main();
+// ---------------------------------------------------------------------------
+// React Component
+// ---------------------------------------------------------------------------
+export default function WildlifeSensor() {
+  // ── Simulated hardware state ──────────────────────────────────────────
+  const [pirActive, setPirActive] = useState(false); // UI toggle for PIR pin
+  const [diskFree, setDiskFree] = useState(500); // simulated MB free
+
+  // Refs that the async loop reads (avoids stale closure issues)
+  const pirValueRef = useRef(0);
+  const diskFreeRef = useRef(diskFree);
+  const shutdownRef = useRef(false);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    pirValueRef.current = pirActive ? 1 : 0;
+  }, [pirActive]);
+
+  useEffect(() => {
+    diskFreeRef.current = diskFree;
+  }, [diskFree]);
+
+  // ── Sensor runtime state ──────────────────────────────────────────────
+  const [running, setRunning] = useState(false);
+  const [status, setStatus] = useState("Sensor not started.");
+  const [logs, setLogs] = useState([]);
+  const [clips, setClips] = useState([]);
+
+  const logEndRef = useRef(null);
+
+  const addLog = useCallback((level, message) => {
+    const formatted = formatLogMessage(level, message);
+    setLogs((prev) => [...prev, { level, formatted, id: Date.now() + Math.random() }]);
+  }, []);
+
+  const addClip = useCallback((clip) => {
+    setClips((prev) => [clip, ...prev]);
+  }, []);
+
+  // Auto-scroll log
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  // ── Sensor control ────────────────────────────────────────────────────
+  const startSensor = useCallback(() => {
+    if (running) return;
+    shutdownRef.current = false;
+    setRunning(true);
+    setLogs([]);
+    setClips([]);
+    runSensor(
+      pirValueRef,
+      diskFreeRef,
+      shutdownRef,
+      addLog,
+      addClip,
+      setStatus
+    ).finally(() => setRunning(false));
+  }, [running, addLog, addClip]);
+
+  const stopSensor = useCallback(() => {
+    if (!running) return;
+    shutdownRef.current = true;
+    addLog(
+      "INFO",
+      "Shutdown signal received – finishing current clip then exiting."
+    );
+  }, [running, addLog]);
+
+  // ── Level → colour mapping ────────────────────────────────────────────
+  const levelColour = {
+    INFO: "#d4edda",
+    WARNING: "#fff3cd",
+    ERROR: "#f8d7da",
+    CRITICAL: "#f5c6cb",
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────
+  return (
+    <div style={styles.page}>
+      <h1 style={styles.heading}>🦉 Wildlife Camera Sensor</h1>
+
+      {/* ── Config summary ── */}
+      <section style={styles.card}>
+        <h2 style={styles.sectionTitle}>Configuration</h2>
+        <table style={styles.table}>
+          <tbody>
+            {[
+              ["GPIO PIN (BCM)", GPIO_PIN],
+              ["PIR Queue Length", PIR_QUEUE_LEN],
+              ["Resolution", `${CAMERA_RESOLUTION[0]}×${CAMERA_RESOLUTION[1]}`],
+              ["Framerate", `${CAMERA_FRAMERATE} fps`],
+              ["Video Directory", VIDEO_DIR],
+              ["Log File", LOG_FILE],
+              ["Min Record (s)", MIN_RECORD_SECONDS],
+              ["Max Record (s)", MAX_RECORD_SECONDS],
+              ["No-Motion Timeout (s)", NO_MOTION_TIMEOUT],
+              ["Min Free Disk (MB)", MIN_FREE_MB],
+            ].map(([k, v]) => (
+              <tr key={k}>
+                <td style={styles.tdKey}>{k}</td>
+                <td style={styles.tdVal}>{v}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+
+      {/* ── Simulated hardware controls ── */}
+      <section style={styles.card}>
+        <h2 style={styles.sectionTitle}>Simulated Hardware</h2>
+
+        <div style={styles.row}>
+          <label style={styles.label}>
+            PIR Sensor (GPIO {GPIO_PIN})&nbsp;
+            <span style={{ ...styles.badge, background: pirActive ? "#28a745" : "#6c757d" }}>
+              {pirActive ? "HIGH – Motion" : "LOW – No motion"}
+            </span>
+          </label>
+          <button
+            style={{ ...styles.btn, background: pirActive ? "#dc3545" : "#28a745" }}
+            onClick={() => setPirActive((v) => !v)}
+          >
+            {pirActive ? "Clear Motion" : "Trigger Motion"}
+          </button>
+        </div>
+
+        <div style={styles.row}>
+          <label style={styles.label}>
+            Free Disk Space:&nbsp;<strong>{diskFree} MB</strong>
+          </label>
+          <input
+            type="range"
+            min={0}
+            max={2000}
+            step={10}
+            value={diskFree}
+            onChange={(e) => setDiskFree(Number(e.target.value))}
+            style={{ flex: 1, marginLeft: 12 }}
+          />
+        </div>
+      </section>
+
+      {/* ── Sensor control & status ── */}
+      <section style={styles.card}>
+        <h2 style={styles.sectionTitle}>Sensor Control</h2>
+        <div style={styles.row}>
+          <button
+            style={{ ...styles.btn, background: "#007bff" }}
+            onClick={startSensor}
+            disabled={running}
+          >
+            ▶ Start Sensor
+          </button>
+          <button
+            style={{ ...styles.btn, background: "#dc3545", marginLeft: 12 }}
+            onClick={stopSensor}
+            disabled={!running}
+          >
+            ⏹ Stop Sensor
+          </button>
+          <span style={{ marginLeft: 20, fontWeight: 600 }}>
+            Status:&nbsp;
+            <span style={{ color: running ? "#28a745" : "#6c757d" }}>{status}</span>
+          </span>
+        </div>
+      </section>
+
+      {/* ── Recorded clips ── */}
+      <section style={styles.card}>
+        <h2 style={styles.sectionTitle}>Recorded Clips ({clips.length})</h2>
+        {clips.length === 0 ? (
+          <p style={{ color: "#888" }}>No clips yet.</p>
+        ) : (
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>Filename</th>
+                <th style={styles.th}>Duration (s)</th>
+                <th style={styles.th}>Size (MB)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {clips.map((c, i) => (
+                <tr key={i}>
+                  <td style={styles.tdVal}>{c.name}</td>
+                  <td style={styles.tdVal}>{c.duration}</td>
+                  <td style={styles.tdVal}>{c.size}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      {/* ── Log viewer ── */}
+      <section style={styles.card}>
+        <h2 style={styles.sectionTitle}>Sensor Log</h2>
+        <div style={styles.logBox}>
+          {logs.length === 0 && (
+            <span style={{ color: "#888" }}>Log is empty.</span>
+          )}
+          {logs.map((entry) => (
+            <div
+              key={entry.id}
+              style={{
+                ...styles.logLine,
+                background: levelColour[entry.level] || "transparent",
+              }}
+            >
+              {entry.formatted}
+            </div>
+          ))}
+          <div ref={logEndRef} />
+        </div>
+        <button
+          style={{ ...styles.btn, background: "#6c757d", marginTop: 8 }}
+          onClick={() => setLogs([])}
+        >
+          Clear Log
+        </button>
+      </section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
+const styles = {
+  page: {
+    fontFamily: "monospace",
+    maxWidth: 900,
+    margin: "0 auto",
+    padding: "24px 16px",
+    color: "#212529",
+    background: "#f8f9fa",
+    minHeight: "100vh",
+  },
+  heading: {
+    fontSize: 26,
+    marginBottom: 24,
+    borderBottom: "2px solid #343a40",
+    paddingBottom: 8,
+  },
+  card: {
+    background: "#fff",
+    border: "1px solid #dee2e6",
+    borderRadius: 6,
+    padding: 16,
+    marginBottom: 20,
+    boxShadow: "0 1px 3px rgba(0,0,0,.06)",
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: 700,
+    marginTop: 0,
+    marginBottom: 12,
+    color: "#343a40",
+  },
+  table: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: 13,
+  },
+  th: {
+    textAlign: "left",
+    padding: "4px 8px",
+    borderBottom: "1px solid #dee2e6",
+    background: "#e9ecef",
+  },
+  tdKey: {
+    padding: "4px 8px",
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+    width: "40%",
+    borderBottom: "1px solid #f1f3f5",
+  },
+  tdVal: {
+    padding: "4px 8px",
+    borderBottom: "1px solid #f1f3f5",
+  },
+  row: {
+    display: "flex",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 10,
+  },
+  label: {
+    fontWeight: 500,
+    minWidth: 220,
+  },
+  badge: {
+    display: "inline-block",
+    padding: "2px 8px",
+    borderRadius: 12,
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: 700,
+  },
+  btn: {
+    padding: "6px 16px",
+    border: "none",
+    borderRadius: 4,
+    color: "#fff",
+    fontWeight: 600,
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  logBox: {
+    background: "#212529",
+    color: "#f8f9fa",
+    borderRadius: 4,
+    padding: 12,
+    height: 320,
+    overflowY: "auto",
+    fontSize: 12,
+    lineHeight: 1.6,
+  },
+  logLine: {
+    padding: "1px 4px",
+    borderRadius: 2,
+    marginBottom: 1,
+    color: "#212529",
+  },
+};
