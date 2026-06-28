@@ -1,627 +1,480 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+#!/usr/bin/env python3
+"""
+wildlifesensor.py
+-----------------
+Raspberry Pi wildlife camera trap.
 
-// ---------------------------------------------------------------------------
-// Configuration – mirrors the original constants
-// ---------------------------------------------------------------------------
-const GPIO_PIN = 4;
-const PIR_QUEUE_LEN = 5;
-const CAMERA_RESOLUTION = [1280, 720];
-const CAMERA_FRAMERATE = 30;
-const VIDEO_DIR = "/home/pi/wildlife_videos";
-const MIN_RECORD_SECONDS = 10.0;
-const MAX_RECORD_SECONDS = 300.0;
-const NO_MOTION_TIMEOUT = 30.0;
-const LOG_FILE = `${VIDEO_DIR}/sensor.log`;
-const MIN_FREE_MB = 200;
+Hardware
+--------
+- PIR motion sensor on GPIO 4
+- Raspberry Pi Camera Module (any revision)
 
-// ---------------------------------------------------------------------------
-// Utility helpers (pure functions, no React dependency)
-// ---------------------------------------------------------------------------
+Behaviour
+---------
+1. Wait for motion.
+2. Start recording an H.264 video file with a timestamp-based name.
+3. Keep recording for at least MIN_RECORD_SECONDS.
+4. Keep recording until motion stops (or MAX_RECORD_SECONDS is reached).
+5. Stop recording, log the clip, then go back to step 1.
 
-function formatLogMessage(level, message) {
-  const now = new Date();
-  const dateStr = now.toISOString().replace("T", " ").substring(0, 19);
-  const paddedLevel = level.padEnd(8);
-  return `${dateStr}  ${paddedLevel}  ${message}`;
-}
+All errors are caught so the sensor keeps running unattended.
+"""
 
-function makeFilename() {
-  const now = new Date();
-  const pad = (n, len = 2) => String(n).padStart(len, "0");
-  const year = now.getFullYear();
-  const month = pad(now.getMonth() + 1);
-  const day = pad(now.getDate());
-  const hours = pad(now.getHours());
-  const minutes = pad(now.getMinutes());
-  const seconds = pad(now.getSeconds());
-  return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.h264`;
-}
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
-function monotonicSeconds() {
-  return performance.now() / 1000;
-}
+# ---------------------------------------------------------------------------
+# Third-party imports – fail early with a helpful message if missing
+# ---------------------------------------------------------------------------
+try:
+    from gpiozero import MotionSensor
+except ImportError as exc:
+    sys.exit(f"[FATAL] gpiozero not available: {exc}  (run: pip install gpiozero)")
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+try:
+    from picamera import PiCamera
+    from picamera import PiCameraError
+except ImportError as exc:
+    sys.exit(f"[FATAL] picamera not available: {exc}  (run: pip install picamera)")
 
-// ---------------------------------------------------------------------------
-// Simulated hardware state (replaces GPIO / raspivid / disk checks)
-// In the original these are real OS calls; here they are UI-controllable
-// ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Configuration – change these without touching the logic below
+# ---------------------------------------------------------------------------
+GPIO_PIN            = 4          # BCM pin number for the PIR DATA line
+PIR_QUEUE_LEN       = 5          # samples the PIR averages before firing
+PIR_CALIBRATION_TIMEOUT = 30     # seconds to wait for PIR to settle at startup
+CAMERA_RESOLUTION   = (1280, 720)
+CAMERA_FRAMERATE    = 30
+CAMERA_WARMUP_SECS  = 2.0        # auto-exposure warm-up time
+CAMERA_ROTATION     = 0          # degrees: 0, 90, 180, or 270
+VIDEO_DIR           = Path("/home/pi/wildlife_videos")   # where clips are saved
+MIN_RECORD_SECONDS  = 10.0       # always record at least this long
+MAX_RECORD_SECONDS  = 300.0      # hard cap so a stuck PIR doesn't fill the disk
+NO_MOTION_TIMEOUT   = 30.0       # give up waiting for motion-end after this many s
+MOTION_POLL_INTERVAL = 0.1       # seconds between motion-state polls inside a clip
+WAIT_MOTION_TIMEOUT  = 5.0       # seconds per wait_for_motion() call in main loop
+LOG_FILE            = VIDEO_DIR / "sensor.log"
+LOG_LEVEL           = logging.INFO
+MIN_FREE_MB         = 200        # refuse to start a clip if less than this is available
+CLIP_INDEX_FILE     = VIDEO_DIR / "clip_index.csv"  # append-only log of every clip
 
-// Shared mutable refs passed down from the component:
-//   pirValueRef     – current raw PIR pin value (0 or 1), toggled by UI
-//   diskFreeRef     – simulated free MB, editable by UI
-//   recordingFileRef – name of current clip being "recorded"
-//   isRecordingRef  – whether raspivid subprocess is "running"
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def _configure_logging() -> logging.Logger:
+    """Configure console + rotating file logging and return the root logger."""
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
-// ---------------------------------------------------------------------------
-// MotionSensor class – identical logic to original, hardware reads replaced
-// ---------------------------------------------------------------------------
-class MotionSensor {
-  constructor(queueLen, pirValueRef) {
-    this.queueLen = queueLen;
-    this.queue = new Array(queueLen).fill(0);
-    this._motionDetected = false;
-    this.pirValueRef = pirValueRef; // { current: 0|1 }
-  }
+    fmt     = "%(asctime)s  %(levelname)-8s  %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
 
-  // Mirrors the getter: reads current value, updates queue, returns debounced bool
-  get motionDetected() {
-    const val = this.pirValueRef.current;
-    this.queue.push(val);
-    this.queue.shift();
-    const avg = this.queue.reduce((a, b) => a + b, 0) / this.queueLen;
-    this._motionDetected = avg > 0.5;
-    return this._motionDetected;
-  }
+    # Use a rotating file handler so the log never grows without bound.
+    try:
+        from logging.handlers import RotatingFileHandler
+        file_handler: logging.Handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=5 * 1024 * 1024,   # 5 MB per file
+            backupCount=5,
+            encoding="utf-8",
+        )
+    except Exception:
+        # Fall back to a plain FileHandler if RotatingFileHandler fails.
+        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 
-  async waitForMotion(timeoutSeconds) {
-    const deadline = monotonicSeconds() + timeoutSeconds;
-    while (monotonicSeconds() < deadline) {
-      if (this.motionDetected) return true;
-      await sleep(100);
-    }
-    return null;
-  }
+    console_handler = logging.StreamHandler(sys.stdout)
 
-  async waitForNoMotion(timeoutSeconds) {
-    const deadline = monotonicSeconds() + timeoutSeconds;
-    while (monotonicSeconds() < deadline) {
-      if (!this.motionDetected) return;
-      await sleep(100);
-    }
-  }
+    for handler in (file_handler, console_handler):
+        handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
 
-  unexport() {
-    // No real GPIO to release in the browser
-  }
-}
+    logger = logging.getLogger("wildlifesensor")
+    logger.setLevel(LOG_LEVEL)
+    # Avoid duplicate handlers when the module is reloaded in tests.
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
 
-// ---------------------------------------------------------------------------
-// PiCamera class – identical logic, raspivid replaced with simulation
-// ---------------------------------------------------------------------------
-class PiCamera {
-  constructor(recordingFileRef, isRecordingRef) {
-    this.recordingFileRef = recordingFileRef;
-    this.isRecordingRef = isRecordingRef;
-    this._isRecording = false;
-  }
+    return logger
 
-  async warmUp() {
-    // Mirrors the 2-second warm-up sleep
-    await sleep(2000);
-  }
 
-  startRecording(filepath) {
-    if (this._isRecording) throw new Error("Already recording.");
-    this._isRecording = true;
-    this.isRecordingRef.current = true;
-    this.recordingFileRef.current = filepath;
-  }
+log = _configure_logging()
 
-  stopRecording() {
-    if (this._isRecording) {
-      this._isRecording = false;
-      this.isRecordingRef.current = false;
-      this.recordingFileRef.current = null;
-    }
-  }
+# ---------------------------------------------------------------------------
+# Graceful shutdown on SIGINT / SIGTERM
+# ---------------------------------------------------------------------------
+_shutdown_requested = False
 
-  get isRecording() {
-    return this._isRecording;
-  }
 
-  close() {
-    this.stopRecording();
-  }
-}
+def _handle_signal(signum: int, _frame) -> None:
+    """Set the global shutdown flag; the main loop will exit at the next safe point."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    try:
+        sig_name = signal.Signals(signum).name
+    except ValueError:
+        sig_name = str(signum)
+    # Use print here as a last resort in case the logging system is broken.
+    log.info(
+        "Shutdown signal %s received – finishing current clip then exiting.",
+        sig_name,
+    )
 
-// ---------------------------------------------------------------------------
-// Core recording logic – exact translation of recordClip()
-// ---------------------------------------------------------------------------
-async function recordClip(
-  camera,
-  pir,
-  diskFreeRef,
-  shutdownRef,
-  addLog,
-  addClip
-) {
-  // enoughDiskSpace() inlined
-  const free = diskFreeRef.current;
-  if (free < MIN_FREE_MB) {
-    addLog(
-      "WARNING",
-      `Low disk space: ${free.toFixed(1)} MB free (need ${MIN_FREE_MB} MB) – skipping clip.`
-    );
-    return;
-  }
 
-  const filenameOnly = makeFilename();
-  const filepath = `${VIDEO_DIR}/${filenameOnly}`;
-  addLog("INFO", `Motion detected – recording → ${filenameOnly}`);
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
 
-  const startTime = monotonicSeconds();
-  let recording = false;
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-  try {
-    camera.startRecording(filepath);
-    recording = true;
+def _make_filename(directory: Path) -> Path:
+    """Return a unique timestamped H.264 path inside *directory*.
 
-    // ── Minimum buffer ──────────────────────────────────────────────────
-    let elapsed = 0.0;
-    while (elapsed < MIN_RECORD_SECONDS) {
-      if (shutdownRef.current) break;
-      await sleep(100);
-      elapsed = monotonicSeconds() - startTime;
-    }
+    If the obvious name already exists (two events within the same second),
+    a numeric suffix is appended so no clip is ever silently overwritten.
+    """
+    now  = datetime.now()
+    base = now.strftime("%Y-%m-%d_%H-%M-%S")
+    candidate = directory / f"{base}.h264"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{base}_{counter:03d}.h264"
+        counter += 1
+    return candidate
 
-    // ── Wait for motion to stop (with hard cap) ──────────────────────
-    if (!shutdownRef.current) {
-      let motionEndDeadline = monotonicSeconds() + NO_MOTION_TIMEOUT;
-      const maxDeadline = startTime + MAX_RECORD_SECONDS;
 
-      while (!shutdownRef.current) {
-        const nowMono = monotonicSeconds();
+def _free_space_mb(path: Path) -> float:
+    """Return free disk space in MB for the filesystem containing *path*."""
+    try:
+        stat = os.statvfs(path)
+        return (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+    except OSError as exc:
+        log.error("Could not check disk space for %s: %s", path, exc)
+        # Return 0 so callers conservatively refuse to record.
+        return 0.0
 
-        if (nowMono >= maxDeadline) {
-          addLog(
-            "WARNING",
-            `Max recording duration (${MAX_RECORD_SECONDS}s) reached – stopping.`
-          );
-          break;
-        }
 
-        if (!pir.motionDetected) {
-          if (nowMono >= motionEndDeadline) break;
-        } else {
-          motionEndDeadline = monotonicSeconds() + NO_MOTION_TIMEOUT;
-        }
+def _enough_disk_space() -> bool:
+    """Return True when there is enough free space to start a new clip."""
+    free = _free_space_mb(VIDEO_DIR)
+    if free < MIN_FREE_MB:
+        log.warning(
+            "Low disk space: %.1f MB free (need %d MB) – skipping clip.",
+            free,
+            MIN_FREE_MB,
+        )
+        return False
+    return True
 
-        await sleep(100);
-      }
-    }
-  } catch (exc) {
-    addLog("ERROR", `Error during recording: ${exc}`);
-  } finally {
-    if (recording) {
-      try {
-        camera.stopRecording();
-      } catch (exc) {
-        addLog("ERROR", `Error stopping recording: ${exc}`);
-      }
-    }
-  }
 
-  const duration = monotonicSeconds() - startTime;
-  // Simulated file size: CAMERA_FRAMERATE * resolution * bitrate estimate
-  const fileMb = ((duration * CAMERA_FRAMERATE * 0.5) / 1024).toFixed(2);
-  addLog(
-    "INFO",
-    `Clip saved: ${filenameOnly}  (${duration.toFixed(1)} s, ${fileMb} MB)`
-  );
-  addClip({ name: filenameOnly, duration: duration.toFixed(1), size: fileMb });
-}
+def _append_clip_index(filepath: Path, duration: float, file_mb: float) -> None:
+    """Append a one-line CSV record to the clip index so clips can be catalogued."""
+    try:
+        write_header = not CLIP_INDEX_FILE.exists()
+        with CLIP_INDEX_FILE.open("a", encoding="utf-8") as fh:
+            if write_header:
+                fh.write("timestamp,filename,duration_s,size_mb\n")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            fh.write(
+                f"{timestamp},{filepath.name},{duration:.1f},{file_mb:.3f}\n"
+            )
+    except OSError as exc:
+        log.warning("Could not update clip index: %s", exc)
 
-// ---------------------------------------------------------------------------
-// Main loop – exact translation of main()
-// ---------------------------------------------------------------------------
-async function runSensor(
-  pirValueRef,
-  diskFreeRef,
-  shutdownRef,
-  addLog,
-  addClip,
-  setStatus
-) {
-  addLog("INFO", `Wildlife sensor starting up.  Videos → ${VIDEO_DIR}`);
-  setStatus("Initialising PIR…");
 
-  let pir;
-  try {
-    pir = new MotionSensor(PIR_QUEUE_LEN, pirValueRef);
-  } catch (exc) {
-    addLog("CRITICAL", `Could not initialise PIR on GPIO ${GPIO_PIN}: ${exc}`);
-    setStatus("FATAL: PIR init failed");
-    return;
-  }
+# ---------------------------------------------------------------------------
+# Camera context manager
+# ---------------------------------------------------------------------------
 
-  addLog("INFO", `PIR calibrating on GPIO ${GPIO_PIN} …`);
-  setStatus("PIR calibrating…");
-  await pir.waitForNoMotion(30);
-  addLog("INFO", "PIR ready.  Waiting for motion …");
-  setStatus("Waiting for motion…");
+def _open_camera() -> PiCamera:
+    """Initialise and return a ready-to-use PiCamera instance.
 
-  let camera = null;
-  try {
-    const recordingFileRef = { current: null };
-    const isRecordingRef = { current: false };
-    camera = new PiCamera(recordingFileRef, isRecordingRef);
-    addLog(
-      "INFO",
-      `Camera initialised at ${CAMERA_RESOLUTION[0]}x${CAMERA_RESOLUTION[1]} @ ${CAMERA_FRAMERATE} fps.`
-    );
-    setStatus("Camera warming up…");
-    await camera.warmUp();
-    setStatus("Waiting for motion…");
+    Raises
+    ------
+    PiCameraError
+        Propagated from picamera if the hardware cannot be opened.
+    """
+    try:
+        camera = PiCamera()
+    except PiCameraError as exc:
+        log.critical("Failed to open camera: %s", exc, exc_info=True)
+        raise
 
-    while (!shutdownRef.current) {
-      const detected = await pir.waitForMotion(5);
-      if (detected === null) continue; // timeout – loop to check shutdown flag
+    try:
+        camera.resolution = CAMERA_RESOLUTION
+        camera.framerate  = CAMERA_FRAMERATE
+        camera.rotation   = CAMERA_ROTATION
 
-      setStatus("Recording…");
-      await recordClip(camera, pir, diskFreeRef, shutdownRef, addLog, addClip);
+        # Brief warm-up so the sensor auto-exposure settles before we record.
+        log.debug("Camera warm-up (%.1f s) …", CAMERA_WARMUP_SECS)
+        camera.start_preview()
+        time.sleep(CAMERA_WARMUP_SECS)
+        camera.stop_preview()
 
-      if (!shutdownRef.current) {
-        addLog("INFO", "Motion ended – waiting for next event …");
-        setStatus("Waiting for motion…");
-      }
-    }
-  } catch (exc) {
-    addLog("CRITICAL", `Unhandled exception in main loop: ${exc}`);
-    setStatus("FATAL error – see log");
-  } finally {
-    if (camera !== null) {
-      try {
-        camera.close();
-        addLog("INFO", "Camera closed.");
-      } catch {
-        // ignore
-      }
-    }
-    if (pir) pir.unexport();
-    addLog("INFO", "Wildlife sensor shut down cleanly.");
-    setStatus("Shut down.");
-  }
-}
+        log.info(
+            "Camera initialised at %dx%d @ %d fps (rotation=%d°).",
+            CAMERA_RESOLUTION[0],
+            CAMERA_RESOLUTION[1],
+            CAMERA_FRAMERATE,
+            CAMERA_ROTATION,
+        )
+    except Exception:
+        # If configuration fails, close the camera handle before re-raising
+        # so we don't leak the resource.
+        try:
+            camera.close()
+        except Exception:
+            pass
+        raise
 
-// ---------------------------------------------------------------------------
-// React Component
-// ---------------------------------------------------------------------------
-export default function WildlifeSensor() {
-  // ── Simulated hardware state ──────────────────────────────────────────
-  const [pirActive, setPirActive] = useState(false); // UI toggle for PIR pin
-  const [diskFree, setDiskFree] = useState(500); // simulated MB free
+    return camera
 
-  // Refs that the async loop reads (avoids stale closure issues)
-  const pirValueRef = useRef(0);
-  const diskFreeRef = useRef(diskFree);
-  const shutdownRef = useRef(false);
 
-  // Keep refs in sync with state
-  useEffect(() => {
-    pirValueRef.current = pirActive ? 1 : 0;
-  }, [pirActive]);
+# ---------------------------------------------------------------------------
+# Core recording logic
+# ---------------------------------------------------------------------------
 
-  useEffect(() => {
-    diskFreeRef.current = diskFree;
-  }, [diskFree]);
+# Module-level reference to the PIR sensor so that record_clip() can read it.
+# Assigned in main() before record_clip() is ever called.
+pir: MotionSensor
 
-  // ── Sensor runtime state ──────────────────────────────────────────────
-  const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState("Sensor not started.");
-  const [logs, setLogs] = useState([]);
-  const [clips, setClips] = useState([]);
 
-  const logEndRef = useRef(null);
+def record_clip(camera: PiCamera) -> None:
+    """Record one motion-triggered clip.
 
-  const addLog = useCallback((level, message) => {
-    const formatted = formatLogMessage(level, message);
-    setLogs((prev) => [...prev, { level, formatted, id: Date.now() + Math.random() }]);
-  }, []);
+    Parameters
+    ----------
+    camera:
+        An already-initialised, open PiCamera instance.
 
-  const addClip = useCallback((clip) => {
-    setClips((prev) => [clip, ...prev]);
-  }, []);
+    The function returns normally (never raises) so the main loop always
+    continues to the next iteration.
+    """
+    if not _enough_disk_space():
+        # Pause briefly to avoid hammering disk-space checks at full speed.
+        time.sleep(1.0)
+        return
 
-  // Auto-scroll log
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+    filepath   = _make_filename(VIDEO_DIR)
+    start_time = time.monotonic()
+    recording  = False
 
-  // ── Sensor control ────────────────────────────────────────────────────
-  const startSensor = useCallback(() => {
-    if (running) return;
-    shutdownRef.current = false;
-    setRunning(true);
-    setLogs([]);
-    setClips([]);
-    runSensor(
-      pirValueRef,
-      diskFreeRef,
-      shutdownRef,
-      addLog,
-      addClip,
-      setStatus
-    ).finally(() => setRunning(false));
-  }, [running, addLog, addClip]);
+    log.info("Motion detected – recording → %s", filepath.name)
 
-  const stopSensor = useCallback(() => {
-    if (!running) return;
-    shutdownRef.current = true;
-    addLog(
-      "INFO",
-      "Shutdown signal received – finishing current clip then exiting."
-    );
-  }, [running, addLog]);
+    try:
+        camera.start_recording(str(filepath))
+        recording = True
 
-  // ── Level → colour mapping ────────────────────────────────────────────
-  const levelColour = {
-    INFO: "#d4edda",
-    WARNING: "#fff3cd",
-    ERROR: "#f8d7da",
-    CRITICAL: "#f5c6cb",
-  };
+        # ── Phase 1: Mandatory minimum recording window ──────────────────
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= MIN_RECORD_SECONDS:
+                break
+            if _shutdown_requested:
+                log.info("Shutdown requested during minimum buffer – stopping early.")
+                break
+            time.sleep(MOTION_POLL_INTERVAL)
 
-  // ── Render ────────────────────────────────────────────────────────────
-  return (
-    <div style={styles.page}>
-      <h1 style={styles.heading}>🦉 Wildlife Camera Sensor</h1>
+        # ── Phase 2: Record until motion stops or hard cap is reached ─────
+        if not _shutdown_requested:
+            motion_end_deadline = time.monotonic() + NO_MOTION_TIMEOUT
+            max_deadline        = start_time + MAX_RECORD_SECONDS
 
-      {/* ── Config summary ── */}
-      <section style={styles.card}>
-        <h2 style={styles.sectionTitle}>Configuration</h2>
-        <table style={styles.table}>
-          <tbody>
-            {[
-              ["GPIO PIN (BCM)", GPIO_PIN],
-              ["PIR Queue Length", PIR_QUEUE_LEN],
-              ["Resolution", `${CAMERA_RESOLUTION[0]}×${CAMERA_RESOLUTION[1]}`],
-              ["Framerate", `${CAMERA_FRAMERATE} fps`],
-              ["Video Directory", VIDEO_DIR],
-              ["Log File", LOG_FILE],
-              ["Min Record (s)", MIN_RECORD_SECONDS],
-              ["Max Record (s)", MAX_RECORD_SECONDS],
-              ["No-Motion Timeout (s)", NO_MOTION_TIMEOUT],
-              ["Min Free Disk (MB)", MIN_FREE_MB],
-            ].map(([k, v]) => (
-              <tr key={k}>
-                <td style={styles.tdKey}>{k}</td>
-                <td style={styles.tdVal}>{v}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
+            while not _shutdown_requested:
+                now_mono = time.monotonic()
 
-      {/* ── Simulated hardware controls ── */}
-      <section style={styles.card}>
-        <h2 style={styles.sectionTitle}>Simulated Hardware</h2>
+                # Hard cap check
+                if now_mono >= max_deadline:
+                    log.warning(
+                        "Maximum recording duration (%.0f s) reached – stopping.",
+                        MAX_RECORD_SECONDS,
+                    )
+                    break
 
-        <div style={styles.row}>
-          <label style={styles.label}>
-            PIR Sensor (GPIO {GPIO_PIN})&nbsp;
-            <span style={{ ...styles.badge, background: pirActive ? "#28a745" : "#6c757d" }}>
-              {pirActive ? "HIGH – Motion" : "LOW – No motion"}
-            </span>
-          </label>
-          <button
-            style={{ ...styles.btn, background: pirActive ? "#dc3545" : "#28a745" }}
-            onClick={() => setPirActive((v) => !v)}
-          >
-            {pirActive ? "Clear Motion" : "Trigger Motion"}
-          </button>
-        </div>
+                # Read current debounced motion state
+                try:
+                    motion_active = pir.motion_detected
+                except Exception as exc:
+                    log.error("Error reading PIR state: %s – assuming no motion.", exc)
+                    motion_active = False
 
-        <div style={styles.row}>
-          <label style={styles.label}>
-            Free Disk Space:&nbsp;<strong>{diskFree} MB</strong>
-          </label>
-          <input
-            type="range"
-            min={0}
-            max={2000}
-            step={10}
-            value={diskFree}
-            onChange={(e) => setDiskFree(Number(e.target.value))}
-            style={{ flex: 1, marginLeft: 12 }}
-          />
-        </div>
-      </section>
+                if motion_active:
+                    # Motion still ongoing – push the no-motion deadline forward.
+                    motion_end_deadline = time.monotonic() + NO_MOTION_TIMEOUT
+                    log.debug("Motion still active – resetting no-motion deadline.")
+                else:
+                    if now_mono >= motion_end_deadline:
+                        log.debug("No motion for %.0f s – ending clip.", NO_MOTION_TIMEOUT)
+                        break
 
-      {/* ── Sensor control & status ── */}
-      <section style={styles.card}>
-        <h2 style={styles.sectionTitle}>Sensor Control</h2>
-        <div style={styles.row}>
-          <button
-            style={{ ...styles.btn, background: "#007bff" }}
-            onClick={startSensor}
-            disabled={running}
-          >
-            ▶ Start Sensor
-          </button>
-          <button
-            style={{ ...styles.btn, background: "#dc3545", marginLeft: 12 }}
-            onClick={stopSensor}
-            disabled={!running}
-          >
-            ⏹ Stop Sensor
-          </button>
-          <span style={{ marginLeft: 20, fontWeight: 600 }}>
-            Status:&nbsp;
-            <span style={{ color: running ? "#28a745" : "#6c757d" }}>{status}</span>
-          </span>
-        </div>
-      </section>
+                time.sleep(MOTION_POLL_INTERVAL)
 
-      {/* ── Recorded clips ── */}
-      <section style={styles.card}>
-        <h2 style={styles.sectionTitle}>Recorded Clips ({clips.length})</h2>
-        {clips.length === 0 ? (
-          <p style={{ color: "#888" }}>No clips yet.</p>
-        ) : (
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>Filename</th>
-                <th style={styles.th}>Duration (s)</th>
-                <th style={styles.th}>Size (MB)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {clips.map((c, i) => (
-                <tr key={i}>
-                  <td style={styles.tdVal}>{c.name}</td>
-                  <td style={styles.tdVal}>{c.duration}</td>
-                  <td style={styles.tdVal}>{c.size}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
+    except PiCameraError as exc:
+        log.error("PiCamera error during recording: %s", exc, exc_info=True)
+    except Exception as exc:
+        log.error("Unexpected error during recording: %s", exc, exc_info=True)
+    finally:
+        if recording:
+            try:
+                camera.stop_recording()
+                log.debug("camera.stop_recording() called.")
+            except PiCameraError as exc:
+                log.error("PiCamera error stopping recording: %s", exc, exc_info=True)
+            except Exception as exc:
+                log.error("Unexpected error stopping recording: %s", exc, exc_info=True)
 
-      {/* ── Log viewer ── */}
-      <section style={styles.card}>
-        <h2 style={styles.sectionTitle}>Sensor Log</h2>
-        <div style={styles.logBox}>
-          {logs.length === 0 && (
-            <span style={{ color: "#888" }}>Log is empty.</span>
-          )}
-          {logs.map((entry) => (
-            <div
-              key={entry.id}
-              style={{
-                ...styles.logLine,
-                background: levelColour[entry.level] || "transparent",
-              }}
-            >
-              {entry.formatted}
-            </div>
-          ))}
-          <div ref={logEndRef} />
-        </div>
-        <button
-          style={{ ...styles.btn, background: "#6c757d", marginTop: 8 }}
-          onClick={() => setLogs([])}
-        >
-          Clear Log
-        </button>
-      </section>
-    </div>
-  );
-}
+    # ── Post-clip bookkeeping ─────────────────────────────────────────────
+    duration = time.monotonic() - start_time
 
-// ---------------------------------------------------------------------------
-// Styles
-// ---------------------------------------------------------------------------
-const styles = {
-  page: {
-    fontFamily: "monospace",
-    maxWidth: 900,
-    margin: "0 auto",
-    padding: "24px 16px",
-    color: "#212529",
-    background: "#f8f9fa",
-    minHeight: "100vh",
-  },
-  heading: {
-    fontSize: 26,
-    marginBottom: 24,
-    borderBottom: "2px solid #343a40",
-    paddingBottom: 8,
-  },
-  card: {
-    background: "#fff",
-    border: "1px solid #dee2e6",
-    borderRadius: 6,
-    padding: 16,
-    marginBottom: 20,
-    boxShadow: "0 1px 3px rgba(0,0,0,.06)",
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: 700,
-    marginTop: 0,
-    marginBottom: 12,
-    color: "#343a40",
-  },
-  table: {
-    width: "100%",
-    borderCollapse: "collapse",
-    fontSize: 13,
-  },
-  th: {
-    textAlign: "left",
-    padding: "4px 8px",
-    borderBottom: "1px solid #dee2e6",
-    background: "#e9ecef",
-  },
-  tdKey: {
-    padding: "4px 8px",
-    fontWeight: 600,
-    whiteSpace: "nowrap",
-    width: "40%",
-    borderBottom: "1px solid #f1f3f5",
-  },
-  tdVal: {
-    padding: "4px 8px",
-    borderBottom: "1px solid #f1f3f5",
-  },
-  row: {
-    display: "flex",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: 8,
-    marginBottom: 10,
-  },
-  label: {
-    fontWeight: 500,
-    minWidth: 220,
-  },
-  badge: {
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 12,
-    color: "#fff",
-    fontSize: 12,
-    fontWeight: 700,
-  },
-  btn: {
-    padding: "6px 16px",
-    border: "none",
-    borderRadius: 4,
-    color: "#fff",
-    fontWeight: 600,
-    cursor: "pointer",
-    fontSize: 13,
-  },
-  logBox: {
-    background: "#212529",
-    color: "#f8f9fa",
-    borderRadius: 4,
-    padding: 12,
-    height: 320,
-    overflowY: "auto",
-    fontSize: 12,
-    lineHeight: 1.6,
-  },
-  logLine: {
-    padding: "1px 4px",
-    borderRadius: 2,
-    marginBottom: 1,
-    color: "#212529",
-  },
-};
+    if filepath.exists():
+        file_mb = filepath.stat().st_size / (1024 * 1024)
+        log.info(
+            "Clip saved: %s  (%.1f s, %.2f MB)",
+            filepath.name,
+            duration,
+            file_mb,
+        )
+        _append_clip_index(filepath, duration, file_mb)
+
+        # Warn if the resulting file is suspiciously small (likely corrupt).
+        if file_mb < 0.01:
+            log.warning(
+                "Clip %s is very small (%.3f MB) – it may be corrupt.",
+                filepath.name,
+                file_mb,
+            )
+    else:
+        log.warning(
+            "Expected clip file not found after recording: %s",
+            filepath,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Entry point: initialise hardware and run the detection/recording loop."""
+    log.info("=" * 60)
+    log.info("Wildlife sensor starting up.")
+    log.info("Videos → %s", VIDEO_DIR)
+    log.info("Free disk: %.1f MB", _free_space_mb(VIDEO_DIR))
+    log.info("=" * 60)
+
+    # Ensure the output directory exists.
+    try:
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.critical("Cannot create video directory %s: %s", VIDEO_DIR, exc)
+        sys.exit(1)
+
+    # ── Initialise PIR ────────────────────────────────────────────────────
+    global pir
+    try:
+        pir = MotionSensor(GPIO_PIN, queue_len=PIR_QUEUE_LEN)
+    except Exception as exc:
+        log.critical(
+            "Could not initialise PIR on GPIO %d: %s",
+            GPIO_PIN,
+            exc,
+            exc_info=True,
+        )
+        sys.exit(1)
+
+    log.info("PIR calibrating on GPIO %d (up to %d s) …", GPIO_PIN, PIR_CALIBRATION_TIMEOUT)
+    try:
+        # Wait for the PIR to report no motion so we don't trigger immediately.
+        pir.wait_for_no_motion(timeout=PIR_CALIBRATION_TIMEOUT)
+        log.info("PIR calibration complete – ready.")
+    except Exception as exc:
+        # Non-fatal: log and continue; the sensor may still work.
+        log.warning(
+            "PIR calibration wait failed (%s) – continuing anyway.", exc
+        )
+
+    log.info("Waiting for motion …")
+
+    # ── Initialise camera ─────────────────────────────────────────────────
+    camera: PiCamera | None = None
+    try:
+        camera = _open_camera()
+    except Exception as exc:
+        log.critical("Cannot open camera: %s", exc, exc_info=True)
+        # Clean up PIR before exit.
+        try:
+            pir.close()
+        except Exception:
+            pass
+        sys.exit(1)
+
+    # ── Main detection / recording loop ───────────────────────────────────
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10  # Give up if the camera keeps failing.
+
+    try:
+        while not _shutdown_requested:
+            try:
+                # wait_for_motion returns None on timeout, True when motion fires.
+                detected = pir.wait_for_motion(timeout=WAIT_MOTION_TIMEOUT)
+            except Exception as exc:
+                log.error("Error waiting for motion: %s", exc, exc_info=True)
+                time.sleep(1.0)
+                continue
+
+            if detected is None:
+                # Timed out – no motion; loop again to check shutdown flag.
+                continue
+
+            # Motion detected – attempt to record a clip.
+            try:
+                record_clip(camera)
+                consecutive_errors = 0
+            except Exception as exc:
+                # record_clip() should not raise, but guard here as a safety net.
+                consecutive_errors += 1
+                log.error(
+                    "record_clip() raised unexpectedly (error %d/%d): %s",
+                    consecutive_errors,
+                    MAX_CONSECUTIVE_ERRORS,
+                    exc,
+                    exc_info=True,
+                )
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    log.critical(
+                        "Too many consecutive errors – shutting down to avoid "
+                        "an infinite error loop."
+                    )
+                    break
+                time.sleep(2.0)
+                continue
+
+            if not _shutdown_requested:
+                log.info("Clip finished – waiting for next motion event …")
+
+    except Exception as exc:
+        log.critical("Unhandled exception in main loop: %s", exc, exc_info=True)
+    finally:
+        # ── Tear-down ─────────────────────────────────────────────────────
+        if camera is not None:
+            try:
+                camera.close()
+                log.info("Camera closed.")
+            except Exception as exc:
+                log.warning("Error closing camera: %s", exc)
+
+        try:
+            pir.close()
+            log.info("PIR closed.")
+        except Exception as exc:
+            log.warning("Error closing PIR: %s", exc)
+
+        log.info("Wildlife sensor shut down cleanly.")
+
+
+if __name__ == "__main__":
+    main()
