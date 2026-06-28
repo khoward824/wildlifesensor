@@ -1,0 +1,139 @@
+# Core Data Science
+pandas==2.2.2
+numpy==1.26.4
+matplotlib==3.9.1
+
+# Scientific Computing
+scipy==1.13.1
+statsmodels==0.14.2
+scikit-learn==1.5.1
+
+# Data Visualization
+seaborn==0.13.2
+plotly==5.22.0
+bokeh==3.4.2
+
+# Jupyter & Notebooks
+jupyter==1.0.0
+jupyterlab==4.2.4
+ipython==8.26.0
+ipykernel==6.29.5
+ipywidgets==8.1.3
+nbformat==5.10.4
+nbconvert==7.16.4
+
+# Data I/O & Formats
+openpyxl==3.1.5
+xlrd==2.0.1
+xlwt==1.3.0
+pyarrow==17.0.0
+fastparquet==2024.5.0
+h5py==3.11.0
+tables==3.9.2
+sqlalchemy==2.0.31
+psycopg2-binary==2.9.9
+pymysql==1.1.1
+
+# HTTP & APIs
+requests==2.32.3
+httpx==0.27.0
+aiohttp==3.9.5
+urllib3==2.2.2
+certifi==2024.7.4
+
+# Data Validation & Quality
+pydantic==2.8.2
+great-expectations==0.18.19
+pandera==0.20.3
+jsonschema==4.23.0
+
+# Utilities
+python-dotenv==1.0.1
+click==8.1.7
+tqdm==4.66.4
+loguru==0.7.2
+rich==13.7.1
+colorama==0.4.6
+tabulate==0.9.0
+prettytable==3.10.2
+
+# Date & Time
+python-dateutil==2.9.0.post0
+pytz==2024.1
+arrow==1.3.0
+
+# String & Text Processing
+chardet==5.2.0
+ftfy==6.2.0
+regex==2024.5.15
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.25.1
+
+# Performance & Parallelism
+numba==0.60.0
+cython==3.0.11
+joblib==1.4.2
+dask==2024.7.1
+multiprocess==0.70.16
+psutil==6.0.0
+
+# Configuration & Serialization
+pyyaml==6.0.2
+toml==0.10.2
+tomli==2.0.1
+configparser==7.0.0
+attrs==23.2.0
+cattrs==24.1.2
+
+# Testing
+pytest==8.3.1
+pytest-cov==5.0.0
+pytest-mock==3.14.0
+pytest-asyncio==0.23.8
+hypothesis==6.108.5
+faker==26.0.0
+
+# Code Quality & Linting
+black==24.4.2
+flake8==7.1.0
+isort==5.13.2
+mypy==1.11.0
+pylint==3.2.6
+bandit==1.7.9
+pre-commit==3.7.1
+
+# Type Stubs
+pandas-stubs==2.2.2.240603
+types-requests==2.32.0.20240712
+types-PyYAML==6.0.12.20240311
+types-python-dateutil==2.9.0.20240316
+types-tabulate==0.9.0.20240106
+
+# Documentation
+sphinx==7.4.7
+sphinx-rtd-theme==2.0.0
+myst-parser==3.0.1
+
+# Compression & Archiving
+zstandard==0.23.0
+lz4==4.3.3
+
+# Cryptography & Security
+cryptography==43.0.0
+bcrypt==4.2.0
+
+# Profiling & Debugging
+memory-profiler==0.61.0
+line-profiler==4.1.3
+py-spy==0.3.14
+
+# Miscellaneous
+packaging==24.1
+setuptools==72.1.0
+wheel==0.43.0
+six==1.16.0
+more-itertools==10.3.0
+toolz==0.12.1
+cytoolz==0.12.3
+decorator==5.1.1
+wrapt==1.16.0
